@@ -3,7 +3,8 @@
 Breeze-ASR-25 全域語音聽寫 + AI 問答
 ──────────────────────────────────────
 【Copilot 鍵】          → 切換錄音(開始/停止),結果貼到游標處
-【右Alt + Copilot 鍵】  → AI 模式:把剪貼簿內容 + 語音問題送 LLM,回覆放回剪貼簿
+【右Alt + Copilot 鍵】  → AI 模式:剪貼簿內容 + 語音問題送 LLM,回覆用台灣腔念出來
+                          (AI_TTS=False 則改回貼上文字)
 
 模型常駐 VRAM,只在啟動時載入一次。
 結束程式:在這個視窗按 Ctrl+C。
@@ -13,6 +14,8 @@ import os
 import time
 import wave
 import json
+import ctypes
+import asyncio
 import tempfile
 import threading
 import winsound
@@ -32,6 +35,12 @@ import torch
 import keyboard
 import pyperclip
 from transformers import pipeline
+
+try:
+    import edge_tts
+    _HAS_TTS = True
+except ImportError:
+    _HAS_TTS = False
 
 # ───────────────────────── 設定 ─────────────────────────
 MODEL_DIR    = _BASE / "models" / "Breeze-ASR-25"
@@ -58,6 +67,13 @@ AI_SYSTEM_PROMPT   = (
 # maxlen = AI_HISTORY_TURNS * 2,因為每輪有兩條訊息
 _chat_history: deque = deque(maxlen=AI_HISTORY_TURNS * 2)
 
+# ── AI 語音回覆(TTS)設定 ─────────────────────────────────
+AI_TTS       = True                       # True = AI 回覆用台灣腔念出來(只念不貼)
+AI_TTS_VOICE = "zh-TW-HsiaoChenNeural"    # 曉臻(女,台灣腔)
+AI_TTS_RATE  = "+20%"                      # 語速
+AI_TTS_PITCH = "+18Hz"                     # 音調(偏高)
+_tts_lock    = threading.Lock()
+
 # ─────────────────────── 提示音 ───────────────────────────
 def _make_tone(path, freq, ms, sr=44100, volume=0.35):
     n = int(sr * ms / 1000)
@@ -77,6 +93,7 @@ _SND_STOP     = os.path.join(_snd_dir, "dictate_stop.wav")
 _SND_ERR      = os.path.join(_snd_dir, "dictate_err.wav")
 _SND_AI_START = os.path.join(_snd_dir, "dictate_ai_start.wav")
 _SND_AI_DONE  = os.path.join(_snd_dir, "dictate_ai_done.wav")
+_TTS_MP3      = os.path.join(_snd_dir, "dictate_ai_tts.mp3")
 
 _make_tone(_SND_START,    988,  180)   # B5  清亮  = 普通錄音開始
 _make_tone(_SND_STOP,     659,  220)   # E5  沉穩  = 停止/運算
@@ -130,7 +147,12 @@ def _load_vocab_prompt():
 _load_vocab_prompt()
 
 if OPENROUTER_API_KEY:
-    print("OpenRouter AI 模式已就緒。")
+    if AI_TTS and _HAS_TTS:
+        print(f"OpenRouter AI 模式已就緒(語音回覆:曉臻台灣腔)。")
+    elif AI_TTS and not _HAS_TTS:
+        print("OpenRouter AI 模式已就緒(⚠ 未裝 edge-tts,改貼文字)。")
+    else:
+        print("OpenRouter AI 模式已就緒(文字貼上)。")
 else:
     print("⚠ 未設定 OPENROUTER_API_KEY,AI 模式停用。")
 
@@ -169,6 +191,20 @@ def _paste_text(text: str):
         time.sleep(0.25)
         try:    pyperclip.copy(old)
         except: pass
+
+# ─────────────────────── 台灣腔語音(TTS)─────────────────
+def _speak(text: str):
+    """用 edge-tts 生成台灣腔語音並播放(blocking)。失敗會丟出例外。"""
+    async def _gen():
+        await edge_tts.Communicate(
+            text, AI_TTS_VOICE, rate=AI_TTS_RATE, pitch=AI_TTS_PITCH
+        ).save(_TTS_MP3)
+    asyncio.run(_gen())
+    w = ctypes.windll.winmm.mciSendStringW
+    with _tts_lock:
+        w(f'open "{_TTS_MP3}" type mpegvideo alias aitts', None, 0, None)
+        w("play aitts wait", None, 0, None)   # wait = 播完才返回
+        w("close aitts", None, 0, None)
 
 # ─────────────────────── OpenRouter LLM ──────────────────
 def _ask_llm(context: str, question: str) -> str:
@@ -245,9 +281,18 @@ def _ai_worker(audio: np.ndarray, context: str):
         answer = _ask_llm(context, question)
         print(f"  → LLM ({time.time()-t1:.1f}s) {answer!r}")
 
-        beep_ai_done()
-        _paste_text(answer)
-        print("  ✓ 回覆已貼上。")
+        if AI_TTS and _HAS_TTS:
+            print("  → 念出回覆中…")
+            try:
+                _speak(answer)
+                print("  ✓ 已念出。")
+            except Exception as e:
+                print(f"  ⚠ 語音失敗,改貼文字: {e}")
+                _paste_text(answer)
+        else:
+            beep_ai_done()
+            _paste_text(answer)
+            print("  ✓ 回覆已貼上。")
     except Exception as e:
         print(f"  ✗ AI 模式失敗: {e}")
         beep_error()
