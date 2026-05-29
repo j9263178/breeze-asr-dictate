@@ -45,7 +45,7 @@ VOCAB_FILE   = _BASE / "vocab.txt"
 # ── OpenRouter 設定 ───────────────────────────────────────
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "")
 OPENROUTER_URL     = "https://openrouter.ai/api/v1/chat/completions"
-OPENROUTER_MODEL   = "qwen/qwen3-235b-a22b"
+OPENROUTER_MODEL   = "openai/gpt-4.1-nano"
 AI_HISTORY_TURNS   = 15          # 保留最近幾輪對話(每輪 = user + assistant)
 AI_SYSTEM_PROMPT   = (
     "你是一個高效的中英雙語助理。"
