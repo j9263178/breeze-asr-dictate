@@ -11,6 +11,7 @@ Breeze-ASR-25 全域語音聽寫 + AI 問答
 """
 
 import os
+import re
 import time
 import wave
 import json
@@ -51,16 +52,18 @@ LANGUAGE     = "chinese"
 RESTORE_CLIPBOARD = False
 VOCAB_FILE   = _BASE / "vocab.txt"
 
-# ── OpenRouter 設定 ───────────────────────────────────────
-OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "")
-OPENROUTER_URL     = "https://openrouter.ai/api/v1/chat/completions"
-OPENROUTER_MODEL   = "openai/gpt-4.1-nano"
-AI_HISTORY_TURNS   = 15          # 保留最近幾輪對話(每輪 = user + assistant)
-AI_SYSTEM_PROMPT   = (
+# ── xAI (Grok) 設定 ───────────────────────────────────────
+XAI_API_KEY    = os.getenv("XAI_API_KEY", "")
+XAI_URL        = "https://api.x.ai/v1/responses"   # Responses API(支援 web_search 工具)
+XAI_MODEL      = "grok-4-fast-non-reasoning"        # 非推理模型
+AI_WEB_SEARCH  = True            # True = 開啟即時網路搜尋(模型自行判斷需不需要搜)
+AI_HISTORY_TURNS = 15            # 保留最近幾輪對話(每輪 = user + assistant)
+AI_SYSTEM_PROMPT = (
     "你是一個高效的中英雙語助理。"
     "使用者會提供一段剪貼簿內容（脈絡）和一個語音問題。"
     "請根據脈絡回答問題，回覆簡潔有力，不要過度解釋。"
     "若脈絡為空，直接回答問題即可。"
+    "需要最新資訊時才使用網路搜尋。"
 )
 
 # 對話記憶:存 {"role": "user"|"assistant", "content": "..."}
@@ -68,7 +71,7 @@ AI_SYSTEM_PROMPT   = (
 _chat_history: deque = deque(maxlen=AI_HISTORY_TURNS * 2)
 
 # ── AI 語音回覆(TTS)設定 ─────────────────────────────────
-AI_TTS       = False                      # True = AI 回覆用台灣腔念出來(只念不貼);False = 貼文字
+AI_TTS       = True                       # True = AI 回覆用台灣腔念出來(只念不貼);False = 貼文字
 AI_TTS_VOICE = "zh-TW-HsiaoChenNeural"    # 曉臻(女,台灣腔)
 AI_TTS_RATE  = "+20%"                      # 語速
 AI_TTS_PITCH = "+18Hz"                     # 音調(偏高)
@@ -146,15 +149,17 @@ def _load_vocab_prompt():
 
 _load_vocab_prompt()
 
-if OPENROUTER_API_KEY:
+if XAI_API_KEY:
+    _search_note = "+網路搜尋" if AI_WEB_SEARCH else ""
     if AI_TTS and _HAS_TTS:
-        print(f"OpenRouter AI 模式已就緒(語音回覆:曉臻台灣腔)。")
+        _out_note = "語音回覆:曉臻台灣腔"
     elif AI_TTS and not _HAS_TTS:
-        print("OpenRouter AI 模式已就緒(⚠ 未裝 edge-tts,改貼文字)。")
+        _out_note = "⚠ 未裝 edge-tts,改貼文字"
     else:
-        print("OpenRouter AI 模式已就緒(文字貼上)。")
+        _out_note = "文字貼上"
+    print(f"Grok AI 模式已就緒({XAI_MODEL}{_search_note};{_out_note})。")
 else:
-    print("⚠ 未設定 OPENROUTER_API_KEY,AI 模式停用。")
+    print("⚠ 未設定 XAI_API_KEY,AI 模式停用。")
 
 print("按【Copilot 鍵】開始說話,再按一次轉錄。")
 print("按【右Alt + Copilot 鍵】進入 AI 模式。")
@@ -193,6 +198,16 @@ def _paste_text(text: str):
         except: pass
 
 # ─────────────────────── 台灣腔語音(TTS)─────────────────
+def _clean_for_speech(text: str) -> str:
+    """念出來前移除 markdown / 引用網址,避免 TTS 把連結念出來。"""
+    # [[1]](http...)、[文字](http...) → 只留文字(citation 標記直接拿掉)
+    text = re.sub(r"\[\[\d+\]\]\([^)]*\)", "", text)        # [[1]](url)
+    text = re.sub(r"\[([^\]]+)\]\([^)]*\)", r"\1", text)    # [文字](url)
+    text = re.sub(r"https?://\S+", "", text)                # 裸網址
+    text = text.replace("**", "").replace("*", "").replace("`", "").replace("#", "")
+    text = re.sub(r"\n{2,}", "\n", text)
+    return text.strip()
+
 def _speak(text: str):
     """用 edge-tts 生成台灣腔語音並播放(blocking)。失敗會丟出例外。"""
     async def _gen():
@@ -206,35 +221,47 @@ def _speak(text: str):
         w("play aitts wait", None, 0, None)   # wait = 播完才返回
         w("close aitts", None, 0, None)
 
-# ─────────────────────── OpenRouter LLM ──────────────────
+# ─────────────────────── xAI (Grok) LLM ──────────────────
+def _extract_answer(data: dict) -> str:
+    """從 Responses API 回應抽出最終文字(output 裡 type=message 的 output_text)。"""
+    parts = []
+    for item in data.get("output", []):
+        if item.get("type") == "message":
+            for c in item.get("content", []):
+                if c.get("type") == "output_text" and c.get("text"):
+                    parts.append(c["text"])
+    return "\n".join(parts).strip()
+
 def _ask_llm(context: str, question: str) -> str:
-    """把 context(剪貼簿) + question(語音) 送到 LLM,回傳回覆文字並更新記憶。"""
+    """把 context(剪貼簿) + question(語音) 送到 Grok(可即時搜尋),回傳回覆並更新記憶。"""
     user_msg = ""
     if context.strip():
         user_msg += f"【剪貼簿內容】\n{context.strip()}\n\n"
     user_msg += f"【問題】\n{question.strip()}"
 
-    # 組合訊息:system + 歷史記錄 + 本次 user
-    messages = [{"role": "system", "content": AI_SYSTEM_PROMPT}]
-    messages += list(_chat_history)           # 最近 N 輪
-    messages.append({"role": "user", "content": user_msg})
+    # Responses API:system 放 instructions,歷史 + 本次 user 放 input
+    input_msgs = list(_chat_history) + [{"role": "user", "content": user_msg}]
+
+    payload = {
+        "model":        XAI_MODEL,
+        "instructions": AI_SYSTEM_PROMPT,
+        "input":        input_msgs,
+    }
+    if AI_WEB_SEARCH:
+        payload["tools"] = [{"type": "web_search"}]   # 模型自行判斷是否搜尋
 
     headers = {
-        "Authorization": f"Bearer {OPENROUTER_API_KEY}",
+        "Authorization": f"Bearer {XAI_API_KEY}",
         "Content-Type":  "application/json",
     }
-    payload = {
-        "model":    OPENROUTER_MODEL,
-        "messages": messages,
-    }
-    resp = requests.post(OPENROUTER_URL, headers=headers,
-                         data=json.dumps(payload), timeout=60)
+    resp = requests.post(XAI_URL, headers=headers,
+                         data=json.dumps(payload), timeout=120)
     resp.raise_for_status()
-    answer = resp.json()["choices"][0]["message"]["content"].strip()
+    answer = _extract_answer(resp.json())
 
     # 把本輪存進記憶
     _chat_history.append({"role": "user",      "content": user_msg})
-    _chat_history.append({"role": "assistant",  "content": answer})
+    _chat_history.append({"role": "assistant", "content": answer})
 
     return answer
 
@@ -284,7 +311,7 @@ def _ai_worker(audio: np.ndarray, context: str):
         if AI_TTS and _HAS_TTS:
             print("  → 念出回覆中…")
             try:
-                _speak(answer)
+                _speak(_clean_for_speech(answer))
                 print("  ✓ 已念出。")
             except Exception as e:
                 print(f"  ⚠ 語音失敗,改貼文字: {e}")
@@ -360,8 +387,8 @@ def _on_f23(event):
     if event.event_type != "down":
         return
     ralt_held = keyboard.is_pressed("right alt")
-    if ralt_held and not OPENROUTER_API_KEY:
-        print("⚠ 未設定 OPENROUTER_API_KEY,AI 模式無法使用。")
+    if ralt_held and not XAI_API_KEY:
+        print("⚠ 未設定 XAI_API_KEY,AI 模式無法使用。")
         beep_error()
         return
     _toggle(ai=ralt_held)
