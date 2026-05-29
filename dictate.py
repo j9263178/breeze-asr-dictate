@@ -16,6 +16,7 @@ import time
 import wave
 import json
 import ctypes
+from ctypes import wintypes
 import asyncio
 import tempfile
 import threading
@@ -49,13 +50,15 @@ SAMPLE_RATE  = 16_000
 MIN_SECONDS  = 0.3
 MAX_SECONDS  = 60
 LANGUAGE     = "chinese"
-RESTORE_CLIPBOARD = False
+OUTPUT_MODE  = "type"        # "type"=直接模擬鍵盤輸入(完全不碰剪貼簿,推薦)
+                             # "clipboard"=複製+Ctrl+V(會覆蓋你剪貼簿的內容)
+RESTORE_CLIPBOARD = False    # 只在 clipboard 模式有效:True=貼完還原原本剪貼簿內容
 VOCAB_FILE   = _BASE / "vocab.txt"
 
 # ── xAI (Grok) 設定 ───────────────────────────────────────
 XAI_API_KEY    = os.getenv("XAI_API_KEY", "")
 XAI_URL        = "https://api.x.ai/v1/responses"   # Responses API(支援 web_search 工具)
-XAI_MODEL      = "grok-4-fast-non-reasoning"        # 非推理模型
+XAI_MODEL      = "grok-4.20-0309-non-reasoning"     # 非推理模型
 AI_WEB_SEARCH  = True            # True = 開啟即時網路搜尋(模型自行判斷需不需要搜)
 AI_HISTORY_TURNS = 15            # 保留最近幾輪對話(每輪 = user + assistant)
 AI_SYSTEM_PROMPT = (
@@ -183,8 +186,58 @@ _stream = sd.InputStream(
 )
 _stream.start()
 
-# ─────────────────────── 貼上工具 ────────────────────────
+# ─────────────────────── 輸出文字 ────────────────────────
+# 用 SendInput 直接送 Unicode 字元 = 模擬鍵盤打字,完全不碰剪貼簿(支援中文)。
+# 注意:union 必須含 MOUSEINPUT,否則 sizeof(INPUT) 對不上 → SendInput 靜默失敗。
+_ULONG_PTR = ctypes.c_size_t   # 指標大小的無號整數(x64=8, x86=4)
+
+class _MOUSEINPUT(ctypes.Structure):
+    _fields_ = [("dx", wintypes.LONG), ("dy", wintypes.LONG),
+                ("mouseData", wintypes.DWORD), ("dwFlags", wintypes.DWORD),
+                ("time", wintypes.DWORD), ("dwExtraInfo", _ULONG_PTR)]
+
+class _KEYBDINPUT(ctypes.Structure):
+    _fields_ = [("wVk", wintypes.WORD), ("wScan", wintypes.WORD),
+                ("dwFlags", wintypes.DWORD), ("time", wintypes.DWORD),
+                ("dwExtraInfo", _ULONG_PTR)]
+
+class _HARDWAREINPUT(ctypes.Structure):
+    _fields_ = [("uMsg", wintypes.DWORD),
+                ("wParamL", wintypes.WORD), ("wParamH", wintypes.WORD)]
+
+class _INPUTUNION(ctypes.Union):
+    _fields_ = [("ki", _KEYBDINPUT), ("mi", _MOUSEINPUT), ("hi", _HARDWAREINPUT)]
+
+class _INPUT(ctypes.Structure):
+    _fields_ = [("type", wintypes.DWORD), ("u", _INPUTUNION)]
+
+_INPUT_KEYBOARD    = 1
+_KEYEVENTF_KEYUP   = 0x0002
+_KEYEVENTF_UNICODE = 0x0004
+
+_SendInput = ctypes.windll.user32.SendInput
+_SendInput.argtypes = (wintypes.UINT, ctypes.POINTER(_INPUT), ctypes.c_int)
+_SendInput.restype  = wintypes.UINT
+
+def _type_unicode(text: str):
+    """逐字以 Unicode 事件送出(不經剪貼簿)。處理 BMP 外字元的代理對。"""
+    units = []
+    for ch in text:
+        b = ch.encode("utf-16-le")
+        for i in range(0, len(b), 2):
+            units.append(b[i] | (b[i + 1] << 8))
+    cb = ctypes.sizeof(_INPUT)
+    for unit in units:
+        for flags in (_KEYEVENTF_UNICODE, _KEYEVENTF_UNICODE | _KEYEVENTF_KEYUP):
+            inp = _INPUT()
+            inp.type = _INPUT_KEYBOARD
+            inp.u.ki = _KEYBDINPUT(0, unit, flags, 0, 0)
+            _SendInput(1, ctypes.byref(inp), cb)
+
 def _paste_text(text: str):
+    if OUTPUT_MODE == "type":
+        _type_unicode(text)          # 直接打字,不動剪貼簿
+        return
     old = ""
     if RESTORE_CLIPBOARD:
         try:    old = pyperclip.paste()
@@ -308,18 +361,18 @@ def _ai_worker(audio: np.ndarray, context: str):
         answer = _ask_llm(context, question)
         print(f"  → LLM ({time.time()-t1:.1f}s) {answer!r}")
 
+        # 永遠先輸出文字(含來源),再念出來
+        _paste_text(answer)
+        print("  ✓ 已輸出文字。")
         if AI_TTS and _HAS_TTS:
             print("  → 念出回覆中…")
             try:
                 _speak(_clean_for_speech(answer))
                 print("  ✓ 已念出。")
             except Exception as e:
-                print(f"  ⚠ 語音失敗,改貼文字: {e}")
-                _paste_text(answer)
+                print(f"  ⚠ 語音失敗: {e}")
         else:
             beep_ai_done()
-            _paste_text(answer)
-            print("  ✓ 回覆已貼上。")
     except Exception as e:
         print(f"  ✗ AI 模式失敗: {e}")
         beep_error()
