@@ -13,6 +13,9 @@ __pycache__/
 # 個人化檔案(可選:若想分享自己的詞庫,刪掉這行)
 # vocab.txt
 
+# API 金鑰
+.env
+
 # 編輯器
 .vscode/
 .idea/
