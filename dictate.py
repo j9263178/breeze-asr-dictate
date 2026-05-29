@@ -3,7 +3,7 @@
 Breeze-ASR-25 全域語音聽寫 + AI 問答
 ──────────────────────────────────────
 【Copilot 鍵】          → 切換錄音(開始/停止),結果貼到游標處
-【Ctrl + Copilot 鍵】   → AI 模式:把剪貼簿內容 + 語音問題送 LLM,回覆放回剪貼簿
+【右Alt + Copilot 鍵】  → AI 模式:把剪貼簿內容 + 語音問題送 LLM,回覆放回剪貼簿
 
 模型常駐 VRAM,只在啟動時載入一次。
 結束程式:在這個視窗按 Ctrl+C。
@@ -78,11 +78,11 @@ _SND_ERR      = os.path.join(_snd_dir, "dictate_err.wav")
 _SND_AI_START = os.path.join(_snd_dir, "dictate_ai_start.wav")
 _SND_AI_DONE  = os.path.join(_snd_dir, "dictate_ai_done.wav")
 
-_make_tone(_SND_START,    988, 180)   # B5  清亮  = 普通錄音開始
-_make_tone(_SND_STOP,     659, 220)   # E5  沉穩  = 停止/運算
-_make_tone(_SND_ERR,      330, 320)   # E4  低    = 沒結果/出錯
-_make_tone(_SND_AI_START, 523, 120)   # C5  柔    = AI 模式開始(第一音)
-_make_tone(_SND_AI_DONE,  784, 280)   # G5  暖    = AI 回覆完成
+_make_tone(_SND_START,    988,  180)   # B5  清亮  = 普通錄音開始
+_make_tone(_SND_STOP,     659,  220)   # E5  沉穩  = 停止/運算
+_make_tone(_SND_ERR,      330,  320)   # E4  低    = 沒結果/出錯
+_make_tone(_SND_AI_START, 1319, 180)   # E6  高亮  = AI 模式開始(比 B5 高一個大六度,一聽即知)
+_make_tone(_SND_AI_DONE,  880,  280)   # A5  暖    = AI 回覆完成
 
 def _play_file(path):
     winsound.PlaySound(path, winsound.SND_FILENAME | winsound.SND_ASYNC)
@@ -90,10 +90,7 @@ def _play_file(path):
 def beep_start():    _play_file(_SND_START)
 def beep_stop():     _play_file(_SND_STOP)
 def beep_error():    _play_file(_SND_ERR)
-def beep_ai_start():
-    # 兩音連響:C5 → G5,表示進入 AI 模式
-    winsound.PlaySound(_SND_AI_START, winsound.SND_FILENAME)   # 同步等第一音結束
-    _play_file(_SND_AI_DONE)                                   # 再播第二音(非同步)
+def beep_ai_start(): _play_file(_SND_AI_START)
 def beep_ai_done():  _play_file(_SND_AI_DONE)
 
 # ─────────────────────── 載入模型 ────────────────────────
@@ -138,7 +135,7 @@ else:
     print("⚠ 未設定 OPENROUTER_API_KEY,AI 模式停用。")
 
 print("按【Copilot 鍵】開始說話,再按一次轉錄。")
-print("按【Ctrl + Copilot 鍵】進入 AI 模式。")
+print("按【右Alt + Copilot 鍵】進入 AI 模式。")
 print("結束請按 Ctrl+C。")
 
 # ─────────────────────── 錄音串流 ────────────────────────
@@ -317,12 +314,12 @@ def _toggle(ai: bool):
 def _on_f23(event):
     if event.event_type != "down":
         return
-    ctrl_held = keyboard.is_pressed("ctrl")
-    if ctrl_held and not OPENROUTER_API_KEY:
+    ralt_held = keyboard.is_pressed("right alt")
+    if ralt_held and not OPENROUTER_API_KEY:
         print("⚠ 未設定 OPENROUTER_API_KEY,AI 模式無法使用。")
         beep_error()
         return
-    _toggle(ai=ctrl_held)
+    _toggle(ai=ralt_held)
 
 keyboard.hook_key("f23", _on_f23, suppress=True)
 
