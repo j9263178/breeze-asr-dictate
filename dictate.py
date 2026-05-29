@@ -16,6 +16,7 @@ import json
 import tempfile
 import threading
 import winsound
+from collections import deque
 from pathlib import Path
 
 _BASE = Path(__file__).parent  # 程式所在資料夾(任何路徑都適用)
@@ -45,12 +46,17 @@ VOCAB_FILE   = _BASE / "vocab.txt"
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "")
 OPENROUTER_URL     = "https://openrouter.ai/api/v1/chat/completions"
 OPENROUTER_MODEL   = "qwen/qwen3-235b-a22b"
+AI_HISTORY_TURNS   = 15          # 保留最近幾輪對話(每輪 = user + assistant)
 AI_SYSTEM_PROMPT   = (
     "你是一個高效的中英雙語助理。"
     "使用者會提供一段剪貼簿內容（脈絡）和一個語音問題。"
     "請根據脈絡回答問題，回覆簡潔有力，不要過度解釋。"
     "若脈絡為空，直接回答問題即可。"
 )
+
+# 對話記憶:存 {"role": "user"|"assistant", "content": "..."}
+# maxlen = AI_HISTORY_TURNS * 2,因為每輪有兩條訊息
+_chat_history: deque = deque(maxlen=AI_HISTORY_TURNS * 2)
 
 # ─────────────────────── 提示音 ───────────────────────────
 def _make_tone(path, freq, ms, sr=44100, volume=0.35):
@@ -169,27 +175,35 @@ def _paste_text(text: str):
 
 # ─────────────────────── OpenRouter LLM ──────────────────
 def _ask_llm(context: str, question: str) -> str:
-    """把 context(剪貼簿) + question(語音) 送到 LLM,回傳回覆文字。"""
+    """把 context(剪貼簿) + question(語音) 送到 LLM,回傳回覆文字並更新記憶。"""
     user_msg = ""
     if context.strip():
         user_msg += f"【剪貼簿內容】\n{context.strip()}\n\n"
     user_msg += f"【問題】\n{question.strip()}"
+
+    # 組合訊息:system + 歷史記錄 + 本次 user
+    messages = [{"role": "system", "content": AI_SYSTEM_PROMPT}]
+    messages += list(_chat_history)           # 最近 N 輪
+    messages.append({"role": "user", "content": user_msg})
 
     headers = {
         "Authorization": f"Bearer {OPENROUTER_API_KEY}",
         "Content-Type":  "application/json",
     }
     payload = {
-        "model": OPENROUTER_MODEL,
-        "messages": [
-            {"role": "system",  "content": AI_SYSTEM_PROMPT},
-            {"role": "user",    "content": user_msg},
-        ],
+        "model":    OPENROUTER_MODEL,
+        "messages": messages,
     }
     resp = requests.post(OPENROUTER_URL, headers=headers,
                          data=json.dumps(payload), timeout=60)
     resp.raise_for_status()
-    return resp.json()["choices"][0]["message"]["content"].strip()
+    answer = resp.json()["choices"][0]["message"]["content"].strip()
+
+    # 把本輪存進記憶
+    _chat_history.append({"role": "user",      "content": user_msg})
+    _chat_history.append({"role": "assistant",  "content": answer})
+
+    return answer
 
 # ─────────────────────── 轉錄 Worker ─────────────────────
 def _transcribe(audio: np.ndarray) -> str:
@@ -228,7 +242,8 @@ def _ai_worker(audio: np.ndarray, context: str):
             beep_error()
             return
 
-        print(f"  → 送 LLM … (脈絡 {len(context)} 字)")
+        turns = len(_chat_history) // 2
+        print(f"  → 送 LLM … (脈絡 {len(context)} 字 / 歷史 {turns} 輪)")
         t1     = time.time()
         answer = _ask_llm(context, question)
         print(f"  → LLM ({time.time()-t1:.1f}s) {answer!r}")
