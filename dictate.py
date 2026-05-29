@@ -68,7 +68,7 @@ AI_SYSTEM_PROMPT   = (
 _chat_history: deque = deque(maxlen=AI_HISTORY_TURNS * 2)
 
 # ── AI 語音回覆(TTS)設定 ─────────────────────────────────
-AI_TTS       = True                       # True = AI 回覆用台灣腔念出來(只念不貼)
+AI_TTS       = False                      # True = AI 回覆用台灣腔念出來(只念不貼);False = 貼文字
 AI_TTS_VOICE = "zh-TW-HsiaoChenNeural"    # 曉臻(女,台灣腔)
 AI_TTS_RATE  = "+20%"                      # 語速
 AI_TTS_PITCH = "+18Hz"                     # 音調(偏高)
