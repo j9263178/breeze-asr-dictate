@@ -1,0 +1,19 @@
+# 自訂詞彙 — 一行一個詞
+# 把「你常講、但模型常認錯」的詞加在這裡(人名、品牌、術語、英文縮寫…)
+# 以 # 開頭的行是註解,會被忽略;空白行也會忽略。
+# 改完存檔後,重新啟動 dictate.py 即生效。
+#
+# 範例(可自行增刪):
+# 聯發科
+# Breeze-ASR-25
+# 台積電
+# Kubernetes
+
+# ── AI 助理 / 模型名稱(發音多元、容易認錯)──
+Claude
+Gemini
+ChatGPT
+OpenAI
+Anthropic
+Copilot
+Llama

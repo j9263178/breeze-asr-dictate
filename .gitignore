@@ -1,0 +1,20 @@
+# Python 虛擬環境
+.venv/
+venv/
+
+# 模型權重(約 3GB,請依 README 自行下載到 models/Breeze-ASR-25/)
+models/
+
+# Python 快取
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# 個人化檔案(可選:若想分享自己的詞庫,刪掉這行)
+# vocab.txt
+
+# 編輯器
+.vscode/
+.idea/
+*.swp
+.DS_Store
