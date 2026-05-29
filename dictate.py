@@ -245,9 +245,9 @@ def _ai_worker(audio: np.ndarray, context: str):
         answer = _ask_llm(context, question)
         print(f"  → LLM ({time.time()-t1:.1f}s) {answer!r}")
 
-        pyperclip.copy(answer)
         beep_ai_done()
-        print("  ✓ 回覆已複製到剪貼簿,按 Ctrl+V 貼上。")
+        _paste_text(answer)
+        print("  ✓ 回覆已貼上。")
     except Exception as e:
         print(f"  ✗ AI 模式失敗: {e}")
         beep_error()
