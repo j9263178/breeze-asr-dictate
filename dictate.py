@@ -15,6 +15,9 @@ import wave
 import tempfile
 import threading
 import winsound
+from pathlib import Path
+
+_BASE = Path(__file__).parent  # 程式所在資料夾(任何路徑都適用)
 
 import numpy as np
 import sounddevice as sd
@@ -24,14 +27,14 @@ import pyperclip
 from transformers import pipeline
 
 # ───────────────────────── 設定 ─────────────────────────
-MODEL_DIR = r"C:\Users\j9263\brrrrrr\models\Breeze-ASR-25"  # 本機資料夾,不連網
+MODEL_DIR = _BASE / "models" / "Breeze-ASR-25"   # 自動抓程式所在資料夾,不連網
 SAMPLE_RATE = 16_000          # Breeze-ASR-25 / Whisper 固定吃 16kHz
 # 熱鍵 = Copilot 鍵(送 Win+Shift+F23,以獨特的 f23 辨識)
 MIN_SECONDS = 0.3             # 太短的錄音忽略(手滑誤觸)
 MAX_SECONDS = 60              # 錄音上限:超過自動停止轉錄(防忘記按第二下)
 LANGUAGE = "chinese"          # 強制中文解碼(中英混合仍可正常輸出英文)
 RESTORE_CLIPBOARD = False     # False=辨識結果留在剪貼簿(沒貼到可手動 Ctrl+V);True=還原原本內容
-VOCAB_FILE = r"C:\Users\j9263\brrrrrr\vocab.txt"  # 自訂詞彙(一行一個;# 開頭為註解)
+VOCAB_FILE = _BASE / "vocab.txt"  # 自訂詞彙(一行一個;# 開頭為註解)
 
 # ─────────────────────── 提示音(柔和正弦鈴聲)───────────────────────
 def _make_tone(path, freq, ms, sr=44100, volume=0.35):

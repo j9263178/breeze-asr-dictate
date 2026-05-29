@@ -1,10 +1,11 @@
 """下載 Breeze-ASR-25 並用一段假音訊驗證 GPU 推論可跑通。"""
 import time
+from pathlib import Path
 import numpy as np
 import torch
 from transformers import pipeline
 
-MODEL_ID = r"C:\Users\j9263\brrrrrr\models\Breeze-ASR-25"  # 本機資料夾,不連網
+MODEL_ID = Path(__file__).parent / "models" / "Breeze-ASR-25"  # 自動抓程式所在資料夾
 SR = 16000
 
 print("下載 / 載入模型中…")
