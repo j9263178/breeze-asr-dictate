@@ -101,8 +101,9 @@ GEMINI_TTS_VOICE = "Leda"                 # 30 種預設聲音之一
 #   "Erinome"      — Clear 清晰
 #   "Aoede"        — Breezy 輕盈
 GEMINI_TTS_STYLE = (                      # 語氣指令(放在文字前面)
-    "請用台灣人日常聊天的口吻自然念出以下文字,親切、有溫度,"
-    "不要像在念稿,語速適中:"
+    "請用台灣人平靜、冷靜的口吻念出以下文字,"
+    "語調平穩、不要有太多起伏、不要過度抑揚頓挫,"
+    "語速偏快、流暢俐落,像在簡潔陳述事情:"
 )
 # edge-tts 設定(fallback)
 AI_TTS_VOICE = "zh-TW-HsiaoChenNeural"    # 曉臻(女,台灣腔)
