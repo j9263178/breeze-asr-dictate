@@ -102,9 +102,12 @@ AI_TTS_ENGINE = "cosy"                    # "cosy"   = 本地 CosyVoice 2 server
                                           # "gemini" = Gemini 3.1 Flash TTS(需 GEMINI_API_KEY);
                                           # "edge"   = edge-tts(免費 fallback,較機械)
 # CosyVoice 設定(server 在 cosyvoice/server.py,獨立 conda env)
-COSY_HOST = "127.0.0.1"
-COSY_PORT = 8765
-COSY_RATE = 24000
+COSY_HOST     = "127.0.0.1"
+COSY_PORT     = 8765
+COSY_RATE     = 24000
+COSY_VOICE    = "default"   # 對應 cosyvoice/voices/<name>/;新增聲音用 tools/add_voice.py
+COSY_SPEED    = 1.0         # 0.5~2.0,1.15 = 快 15%、0.9 = 慢 10%
+COSY_INSTRUCT = ""          # 非空 → instruct 模式(語氣指令,例:「用輕鬆的口吻念」),但會慢一點
 # Gemini TTS 設定
 GEMINI_API_KEY  = os.getenv("GEMINI_API_KEY", "")
 GEMINI_TTS_MODEL = "gemini-3.1-flash-tts-preview"
@@ -451,7 +454,12 @@ def _speak_gemini(text: str, cancelled=_NO_CANCEL):
 def _cosy_chunks(text: str):
     """打 cosy server,正確解析 HTTP/1.1 chunked encoding,yield raw PCM bytes。
     用 raw socket 是因為 Python 3.14 的 requests/urllib stream 接收會額外緩衝。"""
-    body = json.dumps({"text": text}).encode("utf-8")
+    body = json.dumps({
+        "text":     text,
+        "voice":    COSY_VOICE,
+        "speed":    COSY_SPEED,
+        "instruct": COSY_INSTRUCT,
+    }, ensure_ascii=False).encode("utf-8")
     req = (
         f"POST /tts HTTP/1.1\r\nHost: {COSY_HOST}:{COSY_PORT}\r\n"
         f"Content-Type: application/json\r\nContent-Length: {len(body)}\r\n"
