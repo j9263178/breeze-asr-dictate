@@ -16,6 +16,7 @@ import time
 import wave
 import json
 import base64
+import random
 import ctypes
 from ctypes import wintypes
 import asyncio
@@ -93,13 +94,10 @@ AI_TTS_ENGINE = "gemini"                  # "gemini" = Gemini 3.1 Flash TTS(需 
 # Gemini TTS 設定
 GEMINI_API_KEY  = os.getenv("GEMINI_API_KEY", "")
 GEMINI_TTS_MODEL = "gemini-3.1-flash-tts-preview"
-GEMINI_TTS_VOICE = "Leda"                 # 30 種預設聲音之一
-# 備胎聲音(想換把這行貼到上面、註解原本那行):
-#   "Achernar"     — Soft 柔
-#   "Sulafat"      — Warm 溫暖
-#   "Laomedeia"    — Upbeat 歡快
-#   "Erinome"      — Clear 清晰
-#   "Aoede"        — Breezy 輕盈
+# 每次念都從這個池子隨機挑一個聲音(避免一直聽到同一個人)。
+# 留空 list 則永遠用單一聲音 GEMINI_TTS_VOICE。
+GEMINI_TTS_VOICES = ["Leda", "Sulafat", "Laomedeia", "Erinome", "Aoede", "Achernar"]
+GEMINI_TTS_VOICE  = "Leda"                # 上面 list 空的時候 fallback 用這個
 GEMINI_TTS_STYLE = (                      # 語氣指令(放在文字前面)
     "請用台灣人平靜、冷靜的口吻念出以下文字,"
     "語調平穩、不要有太多起伏、不要過度抑揚頓挫,"
@@ -346,6 +344,8 @@ def _speak_edge(text: str):
 
 def _speak_gemini(text: str):
     """Gemini 3.1 Flash TTS → PCM → 包成 WAV → MCI 播放(較自然)。"""
+    voice = random.choice(GEMINI_TTS_VOICES) if GEMINI_TTS_VOICES else GEMINI_TTS_VOICE
+    print(f"    (聲音:{voice})")
     url = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_TTS_MODEL}:generateContent"
     body = {
         "contents": [{"parts": [{"text": GEMINI_TTS_STYLE + text}]}],
@@ -353,7 +353,7 @@ def _speak_gemini(text: str):
             "responseModalities": ["AUDIO"],
             "speechConfig": {
                 "voiceConfig": {
-                    "prebuiltVoiceConfig": {"voiceName": GEMINI_TTS_VOICE}
+                    "prebuiltVoiceConfig": {"voiceName": voice}
                 }
             },
         },
