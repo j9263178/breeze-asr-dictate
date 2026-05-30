@@ -77,11 +77,10 @@ AI_SUMMARY_CHARS = 500           # 滾動摘要的字數上限
 AI_SYSTEM_PROMPT = (
     "你是使用者的聰明好友——機智、有活力、帶一點俏皮幽默,講話自然像在跟朋友聊天,"
     "偶爾可以輕輕吐槽一句,但點到為止、絕不刻薄,讓人覺得親切又可靠。"
-    "用台灣口語的繁體中文回答(中英夾雜很自然),簡潔有力、不囉嗦——"
-    "你的回覆會被念出來也會被打字輸出,所以請用純文字回答,像傳訊息一樣自然:"
-    "不要用 markdown(不用 **粗體**、不用 # 標題、不用 - 或 1. 清單、不用 --- 分隔線),"
-    "不要換行(全部寫在同一段),"
-    "不要用 emoji 或表情符號。"
+    "用台灣口語的繁體中文回答(中英夾雜很自然),簡潔有力、不囉嗦。"
+    "請正常使用標點符號(逗號、句號、問號、驚嘆號等),讓句子有自然的停頓和語氣,"
+    "但不要使用任何 markdown 格式(沒有 **粗體**、沒有 # 標題、沒有 - 或 1. 清單、沒有 --- 分隔線),"
+    "也不要用 emoji 或表情符號。"
     "使用者會給你一段剪貼簿內容當脈絡和一個語音問題;依脈絡回答,脈絡為空就直接答。"
     "需要最新資訊時才上網搜尋。"
 )
@@ -364,19 +363,35 @@ def _stop_speech():
     except Exception:
         pass
 
-def _speak_edge(text: str):
+_NO_CANCEL = lambda: False     # 預設「不會被打斷」的 cancel 探測器
+
+def _play_wav_interruptible(path: str, file_type: str, cancelled):
+    """開檔 + 播放;在 open 前最後一次檢查 cancel,避免「過時的回覆」也被播。
+    play 期間如有人按熱鍵,_stop_speech() 會送 MCI stop,本函式就會返回。"""
+    with _tts_lock:
+        if cancelled():
+            return False
+        _mci(f'open "{path}" type {file_type} alias aitts', None, 0, None)
+        try:
+            if cancelled():               # open 完到 play 之間再 check 一次
+                return False
+            _mci("play aitts wait", None, 0, None)
+            return True
+        finally:
+            _mci("close aitts", None, 0, None)
+
+def _speak_edge(text: str, cancelled=_NO_CANCEL):
     """edge-tts → mp3 → MCI 播放(免費 fallback,音色較機械)。"""
     async def _gen():
         await edge_tts.Communicate(
             text, AI_TTS_VOICE, rate=AI_TTS_RATE, pitch=AI_TTS_PITCH
         ).save(_TTS_MP3)
     asyncio.run(_gen())
-    with _tts_lock:
-        _mci(f'open "{_TTS_MP3}" type mpegvideo alias aitts', None, 0, None)
-        _mci("play aitts wait", None, 0, None)
-        _mci("close aitts", None, 0, None)
+    if cancelled():                       # 生成完到播放之間 check
+        return
+    _play_wav_interruptible(_TTS_MP3, "mpegvideo", cancelled)
 
-def _speak_gemini(text: str):
+def _speak_gemini(text: str, cancelled=_NO_CANCEL):
     """Gemini 3.1 Flash TTS → PCM → 包成 WAV → MCI 播放(較自然)。"""
     voice = random.choice(GEMINI_TTS_VOICES) if GEMINI_TTS_VOICES else GEMINI_TTS_VOICE
     print(f"    (聲音:{voice})")
@@ -386,9 +401,7 @@ def _speak_gemini(text: str):
         "generationConfig": {
             "responseModalities": ["AUDIO"],
             "speechConfig": {
-                "voiceConfig": {
-                    "prebuiltVoiceConfig": {"voiceName": voice}
-                }
+                "voiceConfig": {"prebuiltVoiceConfig": {"voiceName": voice}}
             },
         },
     }
@@ -396,9 +409,10 @@ def _speak_gemini(text: str):
                       headers={"Content-Type": "application/json"},
                       data=json.dumps(body), timeout=60)
     r.raise_for_status()
+    if cancelled():                       # HTTP 回來但已被打斷 → 不播
+        return
     part = r.json()["candidates"][0]["content"]["parts"][0]["inlineData"]
     pcm  = base64.b64decode(part["data"])
-    # mime 例:audio/L16;codec=pcm;rate=24000
     rate = 24000
     for kv in part.get("mimeType", "").split(";"):
         kv = kv.strip()
@@ -407,20 +421,19 @@ def _speak_gemini(text: str):
     with wave.open(_TTS_WAV, "wb") as w:
         w.setnchannels(1); w.setsampwidth(2); w.setframerate(rate)
         w.writeframes(pcm)
-    with _tts_lock:
-        _mci(f'open "{_TTS_WAV}" type waveaudio alias aitts', None, 0, None)
-        _mci("play aitts wait", None, 0, None)
-        _mci("close aitts", None, 0, None)
+    if cancelled():
+        return
+    _play_wav_interruptible(_TTS_WAV, "waveaudio", cancelled)
 
-def _speak(text: str):
-    """依設定挑引擎;Gemini 失敗自動 fallback 到 edge-tts,聲音不會直接斷。"""
+def _speak(text: str, cancelled=_NO_CANCEL):
+    """依設定挑引擎;Gemini 失敗自動 fallback 到 edge-tts。"""
     if AI_TTS_ENGINE == "gemini" and GEMINI_API_KEY:
         try:
-            _speak_gemini(text)
+            _speak_gemini(text, cancelled)
             return
         except Exception as e:
             print(f"  ⚠ Gemini TTS 失敗,fallback 改用 edge-tts: {e}")
-    _speak_edge(text)
+    _speak_edge(text, cancelled)
 
 # ─────────────────────── xAI (Grok) LLM ──────────────────
 def _extract_answer(data: dict) -> str:
@@ -574,7 +587,7 @@ def _ai_worker(audio: np.ndarray, context: str, my_session: int):
         if AI_TTS and _tts_available:
             print("  → 念出回覆中…")
             try:
-                _speak(_clean_for_speech(answer))
+                _speak(_clean_for_speech(answer), cancelled=cancelled)
                 print("  ✓ 已念出。" if not cancelled() else "  ⓘ 念到一半被打斷。")
             except Exception as e:
                 print(f"  ⚠ 語音失敗: {e}")
