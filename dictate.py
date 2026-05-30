@@ -21,7 +21,6 @@ import asyncio
 import tempfile
 import threading
 import winsound
-from collections import deque
 from pathlib import Path
 
 _BASE = Path(__file__).parent  # 程式所在資料夾(任何路徑都適用)
@@ -60,18 +59,21 @@ XAI_API_KEY    = os.getenv("XAI_API_KEY", "")
 XAI_URL        = "https://api.x.ai/v1/responses"   # Responses API(支援 web_search 工具)
 XAI_MODEL      = "grok-4.20-0309-non-reasoning"     # 非推理模型
 AI_WEB_SEARCH  = True            # True = 開啟即時網路搜尋(模型自行判斷需不需要搜)
-AI_HISTORY_TURNS = 15            # 保留最近幾輪對話(每輪 = user + assistant)
+AI_HISTORY_TURNS = 15            # 逐字保留的輪數上限,超過就觸發壓縮(每輪 = user + assistant)
+AI_KEEP_RECENT   = 5             # 壓縮後保留最近幾輪逐字,其餘併入摘要
+AI_SUMMARY_CHARS = 500           # 滾動摘要的字數上限
 AI_SYSTEM_PROMPT = (
-    "你是一個高效的中英雙語助理。"
-    "使用者會提供一段剪貼簿內容（脈絡）和一個語音問題。"
-    "請根據脈絡回答問題，回覆簡潔有力，不要過度解釋。"
-    "若脈絡為空，直接回答問題即可。"
-    "需要最新資訊時才使用網路搜尋。"
+    "你是使用者的聰明好友——機智、有活力、帶一點俏皮幽默,講話自然像在跟朋友聊天,"
+    "偶爾可以輕輕吐槽一句,但點到為止、絕不刻薄,讓人覺得親切又可靠。"
+    "用台灣口語的繁體中文回答(中英夾雜很自然),簡潔有力、不囉嗦——"
+    "你的回覆會被念出來也會被打字出來,所以別長篇大論。"
+    "使用者會給你一段剪貼簿內容當脈絡和一個語音問題;依脈絡回答,脈絡為空就直接答。"
+    "需要最新資訊時才上網搜尋。"
 )
 
-# 對話記憶:存 {"role": "user"|"assistant", "content": "..."}
-# maxlen = AI_HISTORY_TURNS * 2,因為每輪有兩條訊息
-_chat_history: deque = deque(maxlen=AI_HISTORY_TURNS * 2)
+# 對話記憶:逐字最近對話(list of {"role","content"})+ 一份滾動摘要
+_chat_history: list = []
+_chat_summary: str = ""
 
 # ── AI 語音回覆(TTS)設定 ─────────────────────────────────
 AI_TTS       = True                       # True = AI 回覆用台灣腔念出來(只念不貼);False = 貼文字
@@ -285,24 +287,15 @@ def _extract_answer(data: dict) -> str:
                     parts.append(c["text"])
     return "\n".join(parts).strip()
 
-def _ask_llm(context: str, question: str) -> str:
-    """把 context(剪貼簿) + question(語音) 送到 Grok(可即時搜尋),回傳回覆並更新記憶。"""
-    user_msg = ""
-    if context.strip():
-        user_msg += f"【剪貼簿內容】\n{context.strip()}\n\n"
-    user_msg += f"【問題】\n{question.strip()}"
-
-    # Responses API:system 放 instructions,歷史 + 本次 user 放 input
-    input_msgs = list(_chat_history) + [{"role": "user", "content": user_msg}]
-
+def _xai_complete(instructions: str, input_msgs: list, web_search: bool) -> str:
+    """呼叫 xAI Responses API,回傳最終文字。"""
     payload = {
         "model":        XAI_MODEL,
-        "instructions": AI_SYSTEM_PROMPT,
+        "instructions": instructions,
         "input":        input_msgs,
     }
-    if AI_WEB_SEARCH:
+    if web_search:
         payload["tools"] = [{"type": "web_search"}]   # 模型自行判斷是否搜尋
-
     headers = {
         "Authorization": f"Bearer {XAI_API_KEY}",
         "Content-Type":  "application/json",
@@ -310,13 +303,63 @@ def _ask_llm(context: str, question: str) -> str:
     resp = requests.post(XAI_URL, headers=headers,
                          data=json.dumps(payload), timeout=120)
     resp.raise_for_status()
-    answer = _extract_answer(resp.json())
+    return _extract_answer(resp.json())
 
-    # 把本輪存進記憶
+def _ask_llm(context: str, question: str) -> str:
+    """把 context(剪貼簿) + question(語音) 送到 Grok(可即時搜尋),回傳回覆並更新記憶。"""
+    user_msg = ""
+    if context.strip():
+        user_msg += f"【剪貼簿內容】\n{context.strip()}\n\n"
+    user_msg += f"【問題】\n{question.strip()}"
+
+    # persona 指令 + 滾動摘要(若有)放 instructions;逐字歷史 + 本次 user 放 input
+    instructions = AI_SYSTEM_PROMPT
+    if _chat_summary:
+        instructions += f"\n\n【先前對話摘要(供延續參考)】\n{_chat_summary}"
+    input_msgs = list(_chat_history) + [{"role": "user", "content": user_msg}]
+
+    answer = _xai_complete(instructions, input_msgs, AI_WEB_SEARCH)
+
+    # 把本輪存進記憶(壓縮在 _ai_worker 輸出完答案後才做,不拖慢回覆)
     _chat_history.append({"role": "user",      "content": user_msg})
     _chat_history.append({"role": "assistant", "content": answer})
 
     return answer
+
+def _condense_history():
+    """逐字歷史超過上限時,把最舊的對話併入滾動摘要(再 call 一次 LLM 壓成 ≤N 字)。"""
+    global _chat_history, _chat_summary
+    if len(_chat_history) <= AI_HISTORY_TURNS * 2:
+        return
+    keep   = AI_KEEP_RECENT * 2
+    old    = _chat_history[:-keep]      # 要折疊的舊訊息
+    recent = _chat_history[-keep:]      # 保留逐字的最近幾輪
+
+    convo = ""
+    for m in old:
+        who = "使用者" if m["role"] == "user" else "助理"
+        convo += f"{who}: {m['content']}\n"
+
+    body = ""
+    if _chat_summary:
+        body += f"【先前摘要】\n{_chat_summary}\n\n"
+    body += f"【要併入的對話】\n{convo}"
+
+    instr = (
+        f"把以下內容濃縮成不超過 {AI_SUMMARY_CHARS} 字的繁體中文摘要,"
+        "保留重點、結論、使用者的偏好與個資、待辦事項和提到的人名,"
+        "讓之後的對話能無縫延續。只輸出摘要本身,不要客套話。"
+    )
+    try:
+        new_summary = _xai_complete(instr, [{"role": "user", "content": body}],
+                                    web_search=False).strip()
+        _chat_summary = new_summary
+        _chat_history = recent
+        print(f"  ⓘ 已壓縮歷史 → 摘要 {len(_chat_summary)} 字,保留最近 {AI_KEEP_RECENT} 輪")
+    except Exception as e:
+        # 壓縮失敗就退回單純丟棄最舊,避免歷史無限增長
+        _chat_history = _chat_history[-AI_HISTORY_TURNS * 2:]
+        print(f"  ⚠ 壓縮失敗,改丟棄最舊: {e}")
 
 # ─────────────────────── 轉錄 Worker ─────────────────────
 def _transcribe(audio: np.ndarray) -> str:
@@ -373,6 +416,9 @@ def _ai_worker(audio: np.ndarray, context: str):
                 print(f"  ⚠ 語音失敗: {e}")
         else:
             beep_ai_done()
+
+        # 答案已交付,最後才壓縮歷史(不影響回覆速度)
+        _condense_history()
     except Exception as e:
         print(f"  ✗ AI 模式失敗: {e}")
         beep_error()
