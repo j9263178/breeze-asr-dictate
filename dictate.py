@@ -51,9 +51,12 @@ SAMPLE_RATE  = 16_000
 MIN_SECONDS  = 0.3
 MAX_SECONDS  = 60
 LANGUAGE     = "chinese"
-OUTPUT_MODE  = "type"        # "type"=直接模擬鍵盤輸入(完全不碰剪貼簿,推薦)
+OUTPUT_MODE  = "type"        # 聽寫輸出:"type"=直接模擬鍵盤輸入(不碰剪貼簿,推薦)
                              # "clipboard"=複製+Ctrl+V(會覆蓋你剪貼簿的內容)
-RESTORE_CLIPBOARD = False    # 只在 clipboard 模式有效:True=貼完還原原本剪貼簿內容
+RESTORE_CLIPBOARD = False    # 只在 OUTPUT_MODE="clipboard" 有效:True=貼完還原
+# AI 回覆專用:長文 + 中文標點用 type 容易被 IME 攔截順序錯亂,改用 clipboard 較穩
+AI_OUTPUT_MODE        = "clipboard"   # "clipboard"=剪貼簿(推薦) / "type"=直接打字
+AI_RESTORE_CLIPBOARD  = True          # True=貼完還原剪貼簿(脈絡 dedup 還是 work)
 VOCAB_FILE   = _BASE / "vocab.txt"
 
 # ── 熱鍵設定 ──────────────────────────────────────────────
@@ -290,21 +293,34 @@ def _type_unicode(text: str):
         if hwnd and old_himc:
             _imm32.ImmAssociateContext(hwnd, old_himc)
 
-def _paste_text(text: str):
-    if OUTPUT_MODE == "type":
-        _type_unicode(text)          # 直接打字,不動剪貼簿
-        return
+def _clipboard_paste(text: str, restore: bool):
+    """經剪貼簿貼上;restore=True 則貼完還原原本內容。"""
     old = ""
-    if RESTORE_CLIPBOARD:
+    if restore:
         try:    old = pyperclip.paste()
         except: old = ""
     pyperclip.copy(text)
     time.sleep(0.05)
     keyboard.send("ctrl+v")
-    if RESTORE_CLIPBOARD:
-        time.sleep(0.25)
+    if restore:
+        # 長文要多等一下讓 Ctrl+V 真的消耗完剪貼簿,再還原
+        time.sleep(max(0.3, len(text) * 0.001))
         try:    pyperclip.copy(old)
         except: pass
+
+def _paste_text(text: str):
+    """聽寫輸出走 OUTPUT_MODE 設定(預設 type)。"""
+    if OUTPUT_MODE == "type":
+        _type_unicode(text)
+        return
+    _clipboard_paste(text, RESTORE_CLIPBOARD)
+
+def _output_ai_text(text: str):
+    """AI 回覆輸出走 AI_OUTPUT_MODE(預設 clipboard,避免中文標點被 IME 攔截錯位)。"""
+    if AI_OUTPUT_MODE == "type":
+        _type_unicode(text)
+        return
+    _clipboard_paste(text, AI_RESTORE_CLIPBOARD)
 
 # ─────────────────────── 文字清理 ────────────────────────
 def _clean_for_typing(text: str) -> str:
@@ -551,7 +567,7 @@ def _ai_worker(audio: np.ndarray, context: str, my_session: int):
         _last_sent_clipboard = snapshot   # 記住這次的剪貼簿,下次比對
 
         # 永遠先輸出文字(攤平成單行純文字),再念出來
-        _paste_text(_clean_for_typing(answer))
+        _output_ai_text(_clean_for_typing(answer))
         print("  ✓ 已輸出文字。")
         # 任一 TTS 引擎可用就念
         _tts_available = (AI_TTS_ENGINE == "gemini" and GEMINI_API_KEY) or _HAS_TTS
