@@ -252,6 +252,21 @@ def _paste_text(text: str):
         try:    pyperclip.copy(old)
         except: pass
 
+# ─────────────────────── 文字清理 ────────────────────────
+def _clean_for_typing(text: str) -> str:
+    """打字輸出前:移除 markdown 記號、把換行收成空格。
+    (多行 + 換行用模擬打字送進輸入框會造成游標亂跳、順序顛倒,攤平成單行最穩。)"""
+    text = re.sub(r"\[\[\d+\]\]\([^)]*\)", "", text)          # [[1]](url) 引用標記
+    text = re.sub(r"\[([^\]]+)\]\([^)]*\)", r"\1", text)      # [文字](url) -> 文字
+    text = re.sub(r"^[ \t]*#{1,6}\s*", "", text, flags=re.M)  # 標題 #
+    text = re.sub(r"^[ \t]*[-*+]\s+", "", text, flags=re.M)   # 項目符號
+    text = re.sub(r"^[ \t]*\d+\.\s+", "", text, flags=re.M)   # 編號清單
+    text = text.replace("**", "").replace("*", "").replace("`", "")
+    text = re.sub(r"-{3,}", "", text)                         # --- 分隔線
+    text = re.sub(r"\s*\n+\s*", " ", text)                    # 換行 -> 空格
+    text = re.sub(r"[ \t]{2,}", " ", text)                    # 多空格收斂
+    return text.strip()
+
 # ─────────────────────── 台灣腔語音(TTS)─────────────────
 def _clean_for_speech(text: str) -> str:
     """念出來前移除 markdown / 引用網址,避免 TTS 把連結念出來。"""
@@ -410,8 +425,8 @@ def _ai_worker(audio: np.ndarray, context: str):
         answer = _ask_llm(context, question)
         print(f"  → LLM ({time.time()-t1:.1f}s) {answer!r}")
 
-        # 永遠先輸出文字(含來源),再念出來
-        _paste_text(answer)
+        # 永遠先輸出文字(攤平成單行純文字,避免換行/markdown 造成亂序),再念出來
+        _paste_text(_clean_for_typing(answer))
         print("  ✓ 已輸出文字。")
         if AI_TTS and _HAS_TTS:
             print("  → 念出回覆中…")
