@@ -187,6 +187,7 @@ _ai_mode   = False          # True = 本次錄音是 AI 問答模式
 _ai_context = ""            # 錄音開始時的剪貼簿快照
 _lock      = threading.Lock()
 _timeout_timer = None
+_session_id = 0             # 每次按熱鍵開始錄音 +1;舊 worker 看到 mismatch 就放棄
 
 def _audio_callback(indata, frames, time_info, status):
     if _recording:
@@ -294,6 +295,16 @@ def _clean_for_speech(text: str) -> str:
     text = re.sub(r"\n{2,}", "\n", text)
     return text.strip()
 
+_mci = ctypes.windll.winmm.mciSendStringW
+
+def _stop_speech():
+    """立刻停止任何播放中的 TTS(打斷用)。安全:沒在播也不會出錯。"""
+    try:
+        _mci("stop aitts", None, 0, None)
+        _mci("close aitts", None, 0, None)
+    except Exception:
+        pass
+
 def _speak(text: str):
     """用 edge-tts 生成台灣腔語音並播放(blocking)。失敗會丟出例外。"""
     async def _gen():
@@ -301,11 +312,10 @@ def _speak(text: str):
             text, AI_TTS_VOICE, rate=AI_TTS_RATE, pitch=AI_TTS_PITCH
         ).save(_TTS_MP3)
     asyncio.run(_gen())
-    w = ctypes.windll.winmm.mciSendStringW
     with _tts_lock:
-        w(f'open "{_TTS_MP3}" type mpegvideo alias aitts', None, 0, None)
-        w("play aitts wait", None, 0, None)   # wait = 播完才返回
-        w("close aitts", None, 0, None)
+        _mci(f'open "{_TTS_MP3}" type mpegvideo alias aitts', None, 0, None)
+        _mci("play aitts wait", None, 0, None)   # wait = 播完(或被 stop)才返回
+        _mci("close aitts", None, 0, None)
 
 # ─────────────────────── xAI (Grok) LLM ──────────────────
 def _extract_answer(data: dict) -> str:
@@ -336,26 +346,21 @@ def _xai_complete(instructions: str, input_msgs: list, web_search: bool) -> str:
     resp.raise_for_status()
     return _extract_answer(resp.json())
 
-def _ask_llm(context: str, question: str) -> str:
-    """把 context(剪貼簿) + question(語音) 送到 Grok(可即時搜尋),回傳回覆並更新記憶。"""
+def _ask_llm(context: str, question: str) -> tuple[str, str]:
+    """把 context + question 送到 Grok(可即時搜尋)。
+    回傳 (answer, user_msg) — 不直接改記憶;由 worker 決定是否提交(打斷時就不提交)。"""
     user_msg = ""
     if context.strip():
         user_msg += f"【剪貼簿內容】\n{context.strip()}\n\n"
     user_msg += f"【問題】\n{question.strip()}"
 
-    # persona 指令 + 滾動摘要(若有)放 instructions;逐字歷史 + 本次 user 放 input
     instructions = AI_SYSTEM_PROMPT
     if _chat_summary:
         instructions += f"\n\n【先前對話摘要(供延續參考)】\n{_chat_summary}"
     input_msgs = list(_chat_history) + [{"role": "user", "content": user_msg}]
 
     answer = _xai_complete(instructions, input_msgs, AI_WEB_SEARCH)
-
-    # 把本輪存進記憶(壓縮在 _ai_worker 輸出完答案後才做,不拖慢回覆)
-    _chat_history.append({"role": "user",      "content": user_msg})
-    _chat_history.append({"role": "assistant", "content": answer})
-
-    return answer
+    return answer, user_msg
 
 def _condense_history():
     """逐字歷史超過上限時,把最舊的對話併入滾動摘要(再 call 一次 LLM 壓成 ≤N 字)。"""
@@ -405,12 +410,14 @@ def _transcribe(audio: np.ndarray) -> str:
         return " ".join(parts)
     return out["text"].strip()
 
-def _dictate_worker(audio: np.ndarray):
-    """普通聽寫模式。"""
+def _dictate_worker(audio: np.ndarray, my_session: int):
+    """普通聽寫模式。被打斷(session 變)就放棄,避免打字打到新一輪錄音的視窗。"""
     try:
         t0   = time.time()
         text = _transcribe(audio)
         print(f"  → ({time.time()-t0:.1f}s) {text!r}")
+        if _session_id != my_session:
+            print("  ⓘ 已被新一輪打斷,丟棄。"); return
         if text:
             _paste_text(text)
         else:
@@ -419,12 +426,16 @@ def _dictate_worker(audio: np.ndarray):
         print(f"  ✗ 轉錄失敗: {e}")
         beep_error()
 
-def _ai_worker(audio: np.ndarray, context: str):
-    """AI 問答模式:ASR → LLM → 剪貼簿。"""
+def _ai_worker(audio: np.ndarray, context: str, my_session: int):
+    """AI 問答模式:ASR → LLM → 打字 + 念。被打斷(session 變)就靜默放棄。"""
+    def cancelled():
+        return _session_id != my_session
     try:
         t0       = time.time()
         question = _transcribe(audio)
         print(f"  → ASR ({time.time()-t0:.1f}s) {question!r}")
+        if cancelled():
+            print("  ⓘ 已被新一輪打斷,丟棄此次回覆。"); return
         if not question:
             beep_error()
             return
@@ -432,34 +443,44 @@ def _ai_worker(audio: np.ndarray, context: str):
         turns = len(_chat_history) // 2
         print(f"  → 送 LLM … (脈絡 {len(context)} 字 / 歷史 {turns} 輪)")
         t1     = time.time()
-        answer = _ask_llm(context, question)
+        answer, user_msg = _ask_llm(context, question)
         print(f"  → LLM ({time.time()-t1:.1f}s) {answer!r}")
+        if cancelled():
+            print("  ⓘ 已被新一輪打斷,丟棄此次回覆。"); return
 
-        # 永遠先輸出文字(攤平成單行純文字,避免換行/markdown 造成亂序),再念出來
+        # 提交本輪到記憶(打斷前不會跑到這,所以記憶乾淨)
+        _chat_history.append({"role": "user",      "content": user_msg})
+        _chat_history.append({"role": "assistant", "content": answer})
+
+        # 永遠先輸出文字(攤平成單行純文字),再念出來
         _paste_text(_clean_for_typing(answer))
         print("  ✓ 已輸出文字。")
         if AI_TTS and _HAS_TTS:
             print("  → 念出回覆中…")
             try:
                 _speak(_clean_for_speech(answer))
-                print("  ✓ 已念出。")
+                print("  ✓ 已念出。" if not cancelled() else "  ⓘ 念到一半被打斷。")
             except Exception as e:
                 print(f"  ⚠ 語音失敗: {e}")
         else:
             beep_ai_done()
 
         # 答案已交付,最後才壓縮歷史(不影響回覆速度)
-        _condense_history()
+        if not cancelled():
+            _condense_history()
     except Exception as e:
         print(f"  ✗ AI 模式失敗: {e}")
         beep_error()
 
 # ─────────────────────── 熱鍵邏輯 ────────────────────────
 def _start_recording(ai: bool):
-    global _recording, _frames, _timeout_timer, _ai_mode, _ai_context
+    global _recording, _frames, _timeout_timer, _ai_mode, _ai_context, _session_id
+    # 打斷任何正在播放/排隊的 TTS,並讓任何進行中的 worker 失效
+    _stop_speech()
     with _lock:
         if _recording:
             return
+        _session_id += 1               # 新一輪:舊 worker 看到 mismatch 會放棄
         _frames    = []
         _recording = True
         _ai_mode   = ai
@@ -501,11 +522,12 @@ def _stop_recording():
     if dur < MIN_SECONDS:
         print(f"  (錄音太短 {dur:.2f}s,忽略)")
         return
+    sid = _session_id
     print(f"■ 停止,長度 {dur:.1f}s,{'AI 問答' if ai else '轉錄'}中…")
     if ai:
-        threading.Thread(target=_ai_worker,     args=(audio, ctx),  daemon=True).start()
+        threading.Thread(target=_ai_worker,      args=(audio, ctx, sid), daemon=True).start()
     else:
-        threading.Thread(target=_dictate_worker, args=(audio,),     daemon=True).start()
+        threading.Thread(target=_dictate_worker, args=(audio, sid),      daemon=True).start()
 
 def _toggle(ai: bool):
     if _recording:
