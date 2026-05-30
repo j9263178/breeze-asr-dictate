@@ -258,20 +258,37 @@ _SendInput = ctypes.windll.user32.SendInput
 _SendInput.argtypes = (wintypes.UINT, ctypes.POINTER(_INPUT), ctypes.c_int)
 _SendInput.restype  = wintypes.UINT
 
+# IME 相關:中文輸入法會攔截 SendInput Unicode 事件,把標點丟到最後。
+# 解法:打字前把 IME 從前景視窗暫時解綁,打完再還原。
+_user32 = ctypes.windll.user32
+_imm32  = ctypes.windll.imm32
+_imm32.ImmAssociateContext.restype  = ctypes.c_void_p
+_imm32.ImmAssociateContext.argtypes = (wintypes.HWND, ctypes.c_void_p)
+_user32.GetForegroundWindow.restype = wintypes.HWND
+
 def _type_unicode(text: str):
-    """逐字以 Unicode 事件送出(不經剪貼簿)。處理 BMP 外字元的代理對。"""
+    """逐字以 Unicode 事件送出(不經剪貼簿)。
+    打字期間暫時解綁中文 IME,避免標點順序錯亂。處理 BMP 外字元的代理對。"""
     units = []
     for ch in text:
         b = ch.encode("utf-16-le")
         for i in range(0, len(b), 2):
             units.append(b[i] | (b[i + 1] << 8))
-    cb = ctypes.sizeof(_INPUT)
-    for unit in units:
-        for flags in (_KEYEVENTF_UNICODE, _KEYEVENTF_UNICODE | _KEYEVENTF_KEYUP):
-            inp = _INPUT()
-            inp.type = _INPUT_KEYBOARD
-            inp.u.ki = _KEYBDINPUT(0, unit, flags, 0, 0)
-            _SendInput(1, ctypes.byref(inp), cb)
+    cb   = ctypes.sizeof(_INPUT)
+    hwnd = _user32.GetForegroundWindow()
+    # 解綁 IME(回傳原本的 HIMC,稍後還原)
+    old_himc = _imm32.ImmAssociateContext(hwnd, None) if hwnd else None
+    try:
+        for unit in units:
+            for flags in (_KEYEVENTF_UNICODE, _KEYEVENTF_UNICODE | _KEYEVENTF_KEYUP):
+                inp = _INPUT()
+                inp.type = _INPUT_KEYBOARD
+                inp.u.ki = _KEYBDINPUT(0, unit, flags, 0, 0)
+                _SendInput(1, ctypes.byref(inp), cb)
+    finally:
+        # 還原 IME 綁定,使用者下次自己打字時 IME 照常運作
+        if hwnd and old_himc:
+            _imm32.ImmAssociateContext(hwnd, old_himc)
 
 def _paste_text(text: str):
     if OUTPUT_MODE == "type":
