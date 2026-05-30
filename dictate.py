@@ -105,7 +105,7 @@ AI_TTS_ENGINE = "cosy"                    # "cosy"   = 本地 CosyVoice 2 server
 COSY_HOST     = "127.0.0.1"
 COSY_PORT     = 8765
 COSY_RATE     = 24000
-COSY_VOICE    = "default"   # 對應 cosyvoice/voices/<name>/;新增聲音用 tools/add_voice.py
+COSY_VOICE    = "tiffy"     # 對應 cosyvoice/voices/<name>/;新增聲音用 tools/add_voice.py
 COSY_SPEED    = 1.0         # 0.5~2.0,1.15 = 快 15%、0.9 = 慢 10%
 COSY_INSTRUCT = ""          # 非空 → instruct 模式(語氣指令,例:「用輕鬆的口吻念」),但會慢一點
 # Gemini TTS 設定
