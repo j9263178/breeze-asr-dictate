@@ -15,6 +15,7 @@ import re
 import time
 import wave
 import json
+import base64
 import ctypes
 from ctypes import wintypes
 import asyncio
@@ -86,10 +87,21 @@ _chat_history: list = []
 _chat_summary: str = ""
 
 # ── AI 語音回覆(TTS)設定 ─────────────────────────────────
-AI_TTS       = True                       # True = AI 回覆用台灣腔念出來(只念不貼);False = 貼文字
+AI_TTS        = True                      # True = AI 回覆用語音念出來;False = 不念
+AI_TTS_ENGINE = "gemini"                  # "gemini" = Gemini 3.1 Flash TTS(需 GEMINI_API_KEY);
+                                          # "edge"   = edge-tts(免費 fallback,較機械)
+# Gemini TTS 設定
+GEMINI_API_KEY  = os.getenv("GEMINI_API_KEY", "")
+GEMINI_TTS_MODEL = "gemini-3.1-flash-tts-preview"
+GEMINI_TTS_VOICE = "Leda"                 # 30 種預設聲音之一(Leda=年輕女聲)
+GEMINI_TTS_STYLE = (                      # 語氣指令(放在文字前面)
+    "請用台灣人日常聊天的口吻自然念出以下文字,親切、有溫度,"
+    "不要像在念稿,語速適中:"
+)
+# edge-tts 設定(fallback)
 AI_TTS_VOICE = "zh-TW-HsiaoChenNeural"    # 曉臻(女,台灣腔)
-AI_TTS_RATE  = "+20%"                      # 語速
-AI_TTS_PITCH = "+18Hz"                     # 音調(偏高)
+AI_TTS_RATE  = "+20%"
+AI_TTS_PITCH = "+18Hz"
 _tts_lock    = threading.Lock()
 
 # ─────────────────────── 提示音 ───────────────────────────
@@ -112,6 +124,7 @@ _SND_ERR      = os.path.join(_snd_dir, "dictate_err.wav")
 _SND_AI_START = os.path.join(_snd_dir, "dictate_ai_start.wav")
 _SND_AI_DONE  = os.path.join(_snd_dir, "dictate_ai_done.wav")
 _TTS_MP3      = os.path.join(_snd_dir, "dictate_ai_tts.mp3")
+_TTS_WAV      = os.path.join(_snd_dir, "dictate_ai_tts.wav")
 
 _make_tone(_SND_START,    988,  180)   # B5  清亮  = 普通錄音開始
 _make_tone(_SND_STOP,     659,  220)   # E5  沉穩  = 停止/運算
@@ -166,8 +179,13 @@ _load_vocab_prompt()
 
 if XAI_API_KEY:
     _search_note = "+網路搜尋" if AI_WEB_SEARCH else ""
-    if AI_TTS and _HAS_TTS:
-        _out_note = "語音回覆:曉臻台灣腔"
+    if AI_TTS:
+        if AI_TTS_ENGINE == "gemini" and GEMINI_API_KEY:
+            _out_note = f"語音:Gemini {GEMINI_TTS_VOICE}"
+        elif _HAS_TTS:
+            _out_note = "語音:edge-tts 曉臻"
+        else:
+            _out_note = "⚠ 無可用 TTS,改貼文字"
     elif AI_TTS and not _HAS_TTS:
         _out_note = "⚠ 未裝 edge-tts,改貼文字"
     else:
@@ -305,8 +323,8 @@ def _stop_speech():
     except Exception:
         pass
 
-def _speak(text: str):
-    """用 edge-tts 生成台灣腔語音並播放(blocking)。失敗會丟出例外。"""
+def _speak_edge(text: str):
+    """edge-tts → mp3 → MCI 播放(免費 fallback,音色較機械)。"""
     async def _gen():
         await edge_tts.Communicate(
             text, AI_TTS_VOICE, rate=AI_TTS_RATE, pitch=AI_TTS_PITCH
@@ -314,8 +332,52 @@ def _speak(text: str):
     asyncio.run(_gen())
     with _tts_lock:
         _mci(f'open "{_TTS_MP3}" type mpegvideo alias aitts', None, 0, None)
-        _mci("play aitts wait", None, 0, None)   # wait = 播完(或被 stop)才返回
+        _mci("play aitts wait", None, 0, None)
         _mci("close aitts", None, 0, None)
+
+def _speak_gemini(text: str):
+    """Gemini 3.1 Flash TTS → PCM → 包成 WAV → MCI 播放(較自然)。"""
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_TTS_MODEL}:generateContent"
+    body = {
+        "contents": [{"parts": [{"text": GEMINI_TTS_STYLE + text}]}],
+        "generationConfig": {
+            "responseModalities": ["AUDIO"],
+            "speechConfig": {
+                "voiceConfig": {
+                    "prebuiltVoiceConfig": {"voiceName": GEMINI_TTS_VOICE}
+                }
+            },
+        },
+    }
+    r = requests.post(url, params={"key": GEMINI_API_KEY},
+                      headers={"Content-Type": "application/json"},
+                      data=json.dumps(body), timeout=60)
+    r.raise_for_status()
+    part = r.json()["candidates"][0]["content"]["parts"][0]["inlineData"]
+    pcm  = base64.b64decode(part["data"])
+    # mime 例:audio/L16;codec=pcm;rate=24000
+    rate = 24000
+    for kv in part.get("mimeType", "").split(";"):
+        kv = kv.strip()
+        if kv.startswith("rate="):
+            rate = int(kv.split("=", 1)[1])
+    with wave.open(_TTS_WAV, "wb") as w:
+        w.setnchannels(1); w.setsampwidth(2); w.setframerate(rate)
+        w.writeframes(pcm)
+    with _tts_lock:
+        _mci(f'open "{_TTS_WAV}" type waveaudio alias aitts', None, 0, None)
+        _mci("play aitts wait", None, 0, None)
+        _mci("close aitts", None, 0, None)
+
+def _speak(text: str):
+    """依設定挑引擎;Gemini 失敗自動 fallback 到 edge-tts,聲音不會直接斷。"""
+    if AI_TTS_ENGINE == "gemini" and GEMINI_API_KEY:
+        try:
+            _speak_gemini(text)
+            return
+        except Exception as e:
+            print(f"  ⚠ Gemini TTS 失敗,fallback 改用 edge-tts: {e}")
+    _speak_edge(text)
 
 # ─────────────────────── xAI (Grok) LLM ──────────────────
 def _extract_answer(data: dict) -> str:
@@ -455,7 +517,9 @@ def _ai_worker(audio: np.ndarray, context: str, my_session: int):
         # 永遠先輸出文字(攤平成單行純文字),再念出來
         _paste_text(_clean_for_typing(answer))
         print("  ✓ 已輸出文字。")
-        if AI_TTS and _HAS_TTS:
+        # 任一 TTS 引擎可用就念
+        _tts_available = (AI_TTS_ENGINE == "gemini" and GEMINI_API_KEY) or _HAS_TTS
+        if AI_TTS and _tts_available:
             print("  → 念出回覆中…")
             try:
                 _speak(_clean_for_speech(answer))
