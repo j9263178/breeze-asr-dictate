@@ -76,16 +76,17 @@ pip install huggingface_hub
 huggingface-cli download MediaTek-Research/Breeze-ASR-25 --local-dir models/Breeze-ASR-25 --exclude "*.safetensors"
 ```
 
-### 6. 設定 API 金鑰
+### 6. 設定 API 金鑰（選用）
 
-建立 `.env` 檔（不會被 git 追蹤）：
+> **不想用 AI 功能可以跳過這步**，普通聽寫完全不需要 API 金鑰。
+
+如果要啟用 AI 問答模式，建立 `.env` 檔（不會被 git 追蹤）：
 
 ```
 XAI_API_KEY=你的_xAI_API_金鑰
 ```
 
-- xAI API 金鑰申請：https://console.x.ai/
-- 沒有金鑰也能用，AI 模式（右 Alt + Copilot）會停用，普通聽寫不受影響
+xAI API 金鑰免費申請：https://console.x.ai/
 
 ### 7. 啟動
 
@@ -102,11 +103,25 @@ XAI_API_KEY=你的_xAI_API_金鑰
 `dictate.py` 最上面可以調：
 
 ```python
+# 熱鍵（沒有 Copilot 鍵的使用者請修改這裡）
+HOTKEY          = "f23"        # 主熱鍵：Copilot 鍵 = f23；可改 "f9"、"scroll lock" 等
+HOTKEY_SUPPRESS = True         # Copilot 鍵需要 True；改其他鍵通常設 False
+AI_MODIFIER     = "right alt"  # AI 模式修飾鍵（同時按住 + 主熱鍵觸發）
+
+# 其他設定
 MAX_SECONDS      = 60       # 最長錄音秒數
 AI_TTS           = True     # AI 回覆是否用台灣腔語音念出來
 AI_HISTORY_TURNS = 15       # AI 對話保留幾輪逐字
 AI_SUMMARY_CHARS = 500      # 滾動摘要字數上限
 OUTPUT_MODE      = "type"   # "type"=直接打字(不動剪貼簿) / "clipboard"=剪貼簿貼上
+```
+
+#### 沒有 Copilot 鍵的設定範例（改成 F9）
+
+```python
+HOTKEY          = "f9"
+HOTKEY_SUPPRESS = False
+AI_MODIFIER     = "right alt"  # 右 Alt + F9 觸發 AI 模式
 ```
 
 ### 自訂詞彙
