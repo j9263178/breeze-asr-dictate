@@ -93,7 +93,13 @@ AI_TTS_ENGINE = "gemini"                  # "gemini" = Gemini 3.1 Flash TTS(需 
 # Gemini TTS 設定
 GEMINI_API_KEY  = os.getenv("GEMINI_API_KEY", "")
 GEMINI_TTS_MODEL = "gemini-3.1-flash-tts-preview"
-GEMINI_TTS_VOICE = "Leda"                 # 30 種預設聲音之一(Leda=年輕女聲)
+GEMINI_TTS_VOICE = "Leda"                 # 30 種預設聲音之一
+# 備胎聲音(想換把這行貼到上面、註解原本那行):
+#   "Achernar"     — Soft 柔
+#   "Sulafat"      — Warm 溫暖
+#   "Laomedeia"    — Upbeat 歡快
+#   "Erinome"      — Clear 清晰
+#   "Aoede"        — Breezy 輕盈
 GEMINI_TTS_STYLE = (                      # 語氣指令(放在文字前面)
     "請用台灣人日常聊天的口吻自然念出以下文字,親切、有溫度,"
     "不要像在念稿,語速適中:"
