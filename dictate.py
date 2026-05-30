@@ -102,8 +102,9 @@ GEMINI_TTS_MODEL = "gemini-3.1-flash-tts-preview"
 GEMINI_TTS_VOICES = ["Leda", "Sulafat", "Laomedeia", "Erinome", "Aoede", "Achernar"]
 GEMINI_TTS_VOICE  = "Leda"                # 上面 list 空的時候 fallback 用這個
 GEMINI_TTS_STYLE = (                      # 語氣指令(放在文字前面)
-    "請用台灣人平靜、冷靜的口吻念出以下文字,"
-    "語調平穩、不要有太多起伏、不要過度抑揚頓挫,"
+    "請用台灣人平靜、輕柔的口吻念出以下文字,"
+    "音量放輕、力道放鬆、像在耳邊輕聲說話,"
+    "語調平穩、不要有太多起伏、不要過度抑揚頓挫、絕對不要用重音強調,"
     "語速偏快、流暢俐落,像在簡潔陳述事情。"
     "偶爾(不是每句都要)可以自然帶入輕微的呼吸聲、輕笑聲、或像 嗯 啊 之類的口頭停頓,"
     "讓聽起來更像真人在說話,但不要刻意誇張:"
