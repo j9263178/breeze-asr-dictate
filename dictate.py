@@ -86,6 +86,7 @@ AI_SYSTEM_PROMPT = (
 # 對話記憶:逐字最近對話(list of {"role","content"})+ 一份滾動摘要
 _chat_history: list = []
 _chat_summary: str = ""
+_last_sent_clipboard: str = ""   # 上次送 AI 的剪貼簿內容,跟這次一樣就不重複送
 
 # ── AI 語音回覆(TTS)設定 ─────────────────────────────────
 AI_TTS        = True                      # True = AI 回覆用語音念出來;False = 不念
@@ -499,6 +500,7 @@ def _dictate_worker(audio: np.ndarray, my_session: int):
 
 def _ai_worker(audio: np.ndarray, context: str, my_session: int):
     """AI 問答模式:ASR → LLM → 打字 + 念。被打斷(session 變)就靜默放棄。"""
+    global _last_sent_clipboard
     def cancelled():
         return _session_id != my_session
     try:
@@ -511,10 +513,17 @@ def _ai_worker(audio: np.ndarray, context: str, my_session: int):
             beep_error()
             return
 
+        # 脈絡去重:跟上次送過的剪貼簿一樣就不重複送
+        snapshot      = context
+        effective_ctx = context
+        if context and context == _last_sent_clipboard:
+            print("  ⓘ 剪貼簿同上一次,不再重複送脈絡。")
+            effective_ctx = ""
+
         turns = len(_chat_history) // 2
-        print(f"  → 送 LLM … (脈絡 {len(context)} 字 / 歷史 {turns} 輪)")
+        print(f"  → 送 LLM … (脈絡 {len(effective_ctx)} 字 / 歷史 {turns} 輪)")
         t1     = time.time()
-        answer, user_msg = _ask_llm(context, question)
+        answer, user_msg = _ask_llm(effective_ctx, question)
         print(f"  → LLM ({time.time()-t1:.1f}s) {answer!r}")
         if cancelled():
             print("  ⓘ 已被新一輪打斷,丟棄此次回覆。"); return
@@ -522,6 +531,7 @@ def _ai_worker(audio: np.ndarray, context: str, my_session: int):
         # 提交本輪到記憶(打斷前不會跑到這,所以記憶乾淨)
         _chat_history.append({"role": "user",      "content": user_msg})
         _chat_history.append({"role": "assistant", "content": answer})
+        _last_sent_clipboard = snapshot   # 記住這次的剪貼簿,下次比對
 
         # 永遠先輸出文字(攤平成單行純文字),再念出來
         _paste_text(_clean_for_typing(answer))
