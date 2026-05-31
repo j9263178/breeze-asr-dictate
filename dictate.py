@@ -73,6 +73,10 @@ AUTO_MODIFIER    = "left alt"  # 自動模式修飾鍵
 AUTO_INTERVAL    = 60          # 每幾秒處理一次(秒)
 AUTO_MIN_RMS     = 0.008       # 靜音閾值:低於此值視為沒講話,跳過不送 AI
 AUTO_CONTEXT     = True        # True = 自動模式也帶剪貼簿脈絡(按下開啟時快照)
+# 全自動模式專用 LLM(走 OpenRouter,比 xAI 便宜)
+AUTO_LLM_URL    = "https://openrouter.ai/api/v1/chat/completions"
+AUTO_LLM_KEY    = os.getenv("OPENROUTER_API_KEY", "")
+AUTO_LLM_MODEL  = "google/gemini-2.0-flash-001"   # 快、便宜、中文好;可換 qwen/qwen-2.5-72b-instruct 等
 
 # ── xAI (Grok) 設定 ───────────────────────────────────────
 XAI_API_KEY    = os.getenv("XAI_API_KEY", "")
@@ -941,16 +945,39 @@ def _auto_tick():
     threading.Thread(target=_auto_worker,
                      args=(audio, _auto_context), daemon=True).start()
 
+def _auto_ask_openrouter(context: str, question: str) -> str:
+    """全自動模式用 OpenRouter(便宜模型)回答,不帶完整歷史、只帶摘要。"""
+    user_msg = ""
+    if context.strip():
+        user_msg += f"【剪貼簿內容】\n{context.strip()}\n\n"
+    user_msg += f"【問題/說話內容】\n{question.strip()}"
+    # system prompt 跟主模式一樣,只是走不同 endpoint
+    sys = AI_SYSTEM_PROMPT
+    if _chat_summary:
+        sys += f"\n\n【先前對話摘要】\n{_chat_summary}"
+    messages = [{"role": "system", "content": sys}]
+    # 只帶最近 5 輪逐字(不帶全部 15 輪,省 token)
+    messages += list(_chat_history)[-10:]
+    messages.append({"role": "user", "content": user_msg})
+    resp = requests.post(
+        AUTO_LLM_URL,
+        headers={"Authorization": f"Bearer {AUTO_LLM_KEY}",
+                 "Content-Type": "application/json"},
+        data=json.dumps({"model": AUTO_LLM_MODEL, "messages": messages}),
+        timeout=60,
+    )
+    resp.raise_for_status()
+    return resp.json()["choices"][0]["message"]["content"].strip(), user_msg
+
 def _auto_worker(audio: np.ndarray, context: str):
-    """全自動模式的 ASR → AI worker(無 session 機制,可與手動模式並存)。"""
+    """全自動模式的 ASR → OpenRouter → TTS worker。"""
     try:
         question = _transcribe(audio)
         print(f"  [auto] ASR: {question!r}")
         if not question.strip():
             return
-        turns = len(_chat_history) // 2
-        print(f"  [auto] 送 AI … (歷史 {turns} 輪)")
-        answer, user_msg = _ask_llm(context, question)
+        print(f"  [auto] 送 {AUTO_LLM_MODEL} …")
+        answer, user_msg = _auto_ask_openrouter(context, question)
         print(f"  [auto] AI: {answer!r}")
         _chat_history.append({"role": "user",      "content": user_msg})
         _chat_history.append({"role": "assistant", "content": answer})
