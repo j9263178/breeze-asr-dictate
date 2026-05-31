@@ -292,15 +292,16 @@ _timeout_timer = None
 _session_id = 0             # 每次按熱鍵開始錄音 +1;舊 worker 看到 mismatch 就放棄
 
 # 全自動模式狀態
-_auto_mode    = False          # 目前是否在自動模式
-_auto_frames  = []             # 自動模式的音訊緩衝(跟手動模式獨立)
-_auto_context = ""             # 開啟時快照的剪貼簿
-_auto_timer   = None           # 計時器物件
+_auto_mode      = False        # 目前是否在自動模式
+_auto_recording = False        # True=正在錄音階段;False=正在 process/念出(暫停收音)
+_auto_frames    = []           # 自動模式的音訊緩衝
+_auto_context   = ""           # 開啟時快照的剪貼簿
+_auto_timer     = None         # 計時器物件
 
 def _audio_callback(indata, frames, time_info, status):
     if _recording:
         _frames.append(indata.copy())
-    if _auto_mode:
+    if _auto_recording:            # 只在錄音階段收音,processing/念出時暫停
         _auto_frames.append(indata.copy())
 
 _stream = sd.InputStream(
@@ -915,33 +916,39 @@ def _toggle(ai: bool):
         _start_recording(ai)
 
 # ─────────────────────── 全自動模式 ──────────────────────
-def _auto_tick():
-    """每 AUTO_INTERVAL 秒觸發一次:把緩衝的音訊做 ASR → AI → 念回覆。"""
-    global _auto_frames, _auto_timer
+def _auto_start_recording():
+    """開始這一輪的錄音階段,錄滿 AUTO_INTERVAL 秒後自動 tick。"""
+    global _auto_recording, _auto_frames, _auto_timer
     if not _auto_mode:
         return
-    # 取出這段音訊並清空緩衝
-    with _lock:
-        frames = list(_auto_frames)
-        _auto_frames = []
-    # 排程下一次 tick
+    _auto_frames = []
+    _auto_recording = True
+    print(f"  [auto] 🎙 開始錄音({AUTO_INTERVAL}s)…")
     _auto_timer = threading.Timer(AUTO_INTERVAL, _auto_tick)
     _auto_timer.daemon = True
     _auto_timer.start()
 
-    if not frames:
+def _auto_tick():
+    """錄音時間到:停止收音 → 處理 → 處理完再開下一輪。"""
+    global _auto_recording, _auto_frames
+    if not _auto_mode:
         return
+    # 停止收音(processing 期間靜默)
+    _auto_recording = False
+    frames = list(_auto_frames)
+    _auto_frames = []
+
+    if not frames:
+        _auto_start_recording(); return
     audio = np.concatenate(frames, axis=0).flatten().astype(np.float32)
     dur = len(audio) / SAMPLE_RATE
-    if dur < 1.0:
-        return
-    # 靜音判斷:RMS 太低代表沒有講話
     rms = float(np.sqrt(np.mean(audio ** 2)))
     if rms < AUTO_MIN_RMS:
-        print(f"  [auto] 靜音跳過 rms={rms:.4f} < {AUTO_MIN_RMS}(可調 AUTO_MIN_RMS)")
-        return
+        print(f"  [auto] 靜音跳過 rms={rms:.4f} < {AUTO_MIN_RMS}")
+        _auto_start_recording(); return
     beep_auto_tick()
-    print(f"  [auto] 處理 {dur:.1f}s 音訊 rms={rms:.4f}(正常講話參考值)")
+    print(f"  [auto] 處理 {dur:.1f}s rms={rms:.4f}")
+    # 在背景 worker 做 ASR+LLM+TTS;worker 結束後再開下一輪
     threading.Thread(target=_auto_worker,
                      args=(audio, _auto_context), daemon=True).start()
 
@@ -970,7 +977,8 @@ def _auto_ask_openrouter(context: str, question: str) -> str:
     return resp.json()["choices"][0]["message"]["content"].strip(), user_msg
 
 def _auto_worker(audio: np.ndarray, context: str):
-    """全自動模式的 ASR → OpenRouter → TTS worker。"""
+    """全自動模式的 ASR → OpenRouter → TTS worker。
+    做完之後(不論成功失敗)自動開下一輪錄音。"""
     try:
         question = _transcribe(audio)
         print(f"  [auto] ASR: {question!r}")
@@ -983,28 +991,32 @@ def _auto_worker(audio: np.ndarray, context: str):
         _chat_history.append({"role": "assistant", "content": answer})
         _output_ai_text(_clean_for_typing(answer))
         if AI_TTS:
-            _speak(_clean_for_speech(answer))
+            _speak(_clean_for_speech(answer))   # 念完才繼續
         _condense_history()
     except Exception as e:
         print(f"  [auto] 錯誤: {e}")
         beep_error()
+    finally:
+        # 無論成功或失敗,都開下一輪(如果還在自動模式)
+        if _auto_mode:
+            time.sleep(0.3)          # 短暫停頓避免直接接上
+            _auto_start_recording()
 
 def _start_auto_mode():
-    global _auto_mode, _auto_frames, _auto_context, _auto_timer
+    global _auto_mode, _auto_recording, _auto_context
     _auto_mode = True
-    _auto_frames = []
+    _auto_recording = False
     if AUTO_CONTEXT:
         try:    _auto_context = pyperclip.paste()
         except: _auto_context = ""
     beep_auto_on()
-    print(f"★★ 全自動模式開啟(每 {AUTO_INTERVAL}s 自動處理)。再按 Left Alt + Copilot 關閉。")
-    _auto_timer = threading.Timer(AUTO_INTERVAL, _auto_tick)
-    _auto_timer.daemon = True
-    _auto_timer.start()
+    print(f"★★ 全自動模式開啟(錄 {AUTO_INTERVAL}s → process → 念完 → 再錄)。再按 Left Alt + Copilot 關閉。")
+    _auto_start_recording()    # 開第一輪錄音
 
 def _stop_auto_mode():
-    global _auto_mode, _auto_timer
-    _auto_mode = False
+    global _auto_mode, _auto_recording, _auto_timer
+    _auto_mode      = False
+    _auto_recording = False
     if _auto_timer:
         _auto_timer.cancel()
         _auto_timer = None
