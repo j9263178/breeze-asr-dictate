@@ -106,7 +106,7 @@ AI_TTS_ENGINE = "eleven"                  # "eleven" = ElevenLabs Flash v2.5(雲
 ELEVEN_API_KEY = os.getenv("ELEVENLABS_API_KEY", "")
 ELEVEN_MODEL   = "eleven_flash_v2_5"      # 低延遲、支援中文
 ELEVEN_RATE    = 24000
-ELEVEN_VOICE   = "EXAVITQu4vr4xnSDxMaL"   # Sarah(free tier 可用);其他:Lily=pFZP5JQG7iQjIQuC4Bku, Matilda=XrExE9yKIg1WjnnlVkGX
+ELEVEN_VOICE   = "ht0yrHEoOG42OGi3ERZs"   # 你選的聲音;其他:Sarah=EXAVITQu4vr4xnSDxMaL, Lily=pFZP5JQG7iQjIQuC4Bku
 ELEVEN_STABILITY = 0.5
 ELEVEN_SIMILARITY = 0.75
 # CosyVoice 設定(server 在 cosyvoice/server.py,獨立 conda env)
@@ -607,14 +607,16 @@ def _speak(text: str, cancelled=_NO_CANCEL):
             _speak_eleven(text, cancelled)
             return
         except Exception as e:
-            print(f"  ⚠ ElevenLabs 失敗,fallback: {e}")
+            print(f"  ⚠ ElevenLabs 失敗,fallback 改用 edge-tts: {e}")
+        _speak_edge(text, cancelled)
+        return
     if AI_TTS_ENGINE == "cosy":
         try:
             _speak_cosy(text, cancelled)
             return
         except Exception as e:
             print(f"  ⚠ CosyVoice 失敗(server 沒開?),fallback: {e}")
-    if GEMINI_API_KEY:
+    if AI_TTS_ENGINE == "gemini" and GEMINI_API_KEY:
         try:
             _speak_gemini(text, cancelled)
             return
