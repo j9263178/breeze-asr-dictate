@@ -98,9 +98,17 @@ _last_sent_clipboard: str = ""   # 上次送 AI 的剪貼簿內容,跟這次一�
 
 # ── AI 語音回覆(TTS)設定 ─────────────────────────────────
 AI_TTS        = True                      # True = AI 回覆用語音念出來;False = 不念
-AI_TTS_ENGINE = "cosy"                    # "cosy"   = 本地 CosyVoice 2 server(最自然,需先啟動 server.py);
+AI_TTS_ENGINE = "eleven"                  # "eleven" = ElevenLabs Flash v2.5(雲端,低延遲,需 ELEVENLABS_API_KEY);
+                                          # "cosy"   = 本地 CosyVoice 2 server(最自然,需先啟動 server.py);
                                           # "gemini" = Gemini 3.1 Flash TTS(需 GEMINI_API_KEY);
                                           # "edge"   = edge-tts(免費 fallback,較機械)
+# ElevenLabs 設定
+ELEVEN_API_KEY = os.getenv("ELEVENLABS_API_KEY", "")
+ELEVEN_MODEL   = "eleven_flash_v2_5"      # 低延遲、支援中文
+ELEVEN_RATE    = 24000
+ELEVEN_VOICE   = "EXAVITQu4vr4xnSDxMaL"   # Sarah(free tier 可用);其他:Lily=pFZP5JQG7iQjIQuC4Bku, Matilda=XrExE9yKIg1WjnnlVkGX
+ELEVEN_STABILITY = 0.5
+ELEVEN_SIMILARITY = 0.75
 # CosyVoice 設定(server 在 cosyvoice/server.py,獨立 conda env)
 COSY_HOST     = "127.0.0.1"
 COSY_PORT     = 8765
@@ -214,7 +222,9 @@ if AI_TTS_ENGINE == "cosy":
 if XAI_API_KEY:
     _search_note = "+網路搜尋" if AI_WEB_SEARCH else ""
     if AI_TTS:
-        if AI_TTS_ENGINE == "cosy" and _cosy_alive:
+        if AI_TTS_ENGINE == "eleven" and ELEVEN_API_KEY:
+            _out_note = "語音:ElevenLabs Flash(streaming)"
+        elif AI_TTS_ENGINE == "cosy" and _cosy_alive:
             _out_note = "語音:CosyVoice 本地(streaming)"
         elif AI_TTS_ENGINE == "gemini" and GEMINI_API_KEY:
             _out_note = f"語音:Gemini {GEMINI_TTS_VOICE}"
@@ -543,15 +553,68 @@ def _speak_cosy(text: str, cancelled=_NO_CANCEL):
         try: stream.close()
         except: pass
 
+def _speak_eleven(text: str, cancelled=_NO_CANCEL):
+    """ElevenLabs Flash v2.5 → streaming PCM → sounddevice 即時播放。"""
+    url = f"https://api.elevenlabs.io/v1/text-to-speech/{ELEVEN_VOICE}/stream"
+    params = {"output_format": f"pcm_{ELEVEN_RATE}",
+              "optimize_streaming_latency": 4}
+    body = {
+        "text": text,
+        "model_id": ELEVEN_MODEL,
+        "voice_settings": {
+            "stability": ELEVEN_STABILITY,
+            "similarity_boost": ELEVEN_SIMILARITY,
+            "use_speaker_boost": True,
+        },
+    }
+    headers = {"xi-api-key": ELEVEN_API_KEY, "Content-Type": "application/json"}
+
+    last_err = None
+    for attempt in range(2):          # abuse detector 偶發 401,retry 一次
+        r = requests.post(url, params=params, headers=headers,
+                          data=json.dumps(body), stream=True, timeout=60)
+        if r.status_code != 200:
+            last_err = f"HTTP {r.status_code}: {r.text[:150]}"
+            r.close()
+            continue
+        stream = sd.OutputStream(samplerate=ELEVEN_RATE, channels=1, dtype="int16")
+        stream.start()
+        leftover = b""
+        try:
+            for chunk in r.iter_content(chunk_size=None):
+                if cancelled():
+                    return
+                if not chunk:
+                    continue
+                blob = leftover + chunk
+                even = len(blob) - (len(blob) % 2)
+                if even:
+                    stream.write(np.frombuffer(blob[:even], dtype=np.int16))
+                leftover = blob[even:]
+        finally:
+            time.sleep(0.15)
+            try: stream.stop()
+            except: pass
+            try: stream.close()
+            except: pass
+        return
+    raise RuntimeError(f"ElevenLabs 失敗: {last_err}")
+
 def _speak(text: str, cancelled=_NO_CANCEL):
     """依設定挑引擎;失敗會 fallback 到下一個可用引擎。"""
+    if AI_TTS_ENGINE == "eleven" and ELEVEN_API_KEY:
+        try:
+            _speak_eleven(text, cancelled)
+            return
+        except Exception as e:
+            print(f"  ⚠ ElevenLabs 失敗,fallback: {e}")
     if AI_TTS_ENGINE == "cosy":
         try:
             _speak_cosy(text, cancelled)
             return
         except Exception as e:
             print(f"  ⚠ CosyVoice 失敗(server 沒開?),fallback: {e}")
-    if AI_TTS_ENGINE in ("cosy", "gemini") and GEMINI_API_KEY:
+    if GEMINI_API_KEY:
         try:
             _speak_gemini(text, cancelled)
             return
@@ -708,7 +771,8 @@ def _ai_worker(audio: np.ndarray, context: str, my_session: int):
         print("  ✓ 已輸出文字。")
         # 任一 TTS 引擎可用就念
         _tts_available = (
-            AI_TTS_ENGINE == "cosy"
+            (AI_TTS_ENGINE == "eleven" and ELEVEN_API_KEY)
+            or AI_TTS_ENGINE == "cosy"
             or (AI_TTS_ENGINE == "gemini" and GEMINI_API_KEY)
             or _HAS_TTS
         )
