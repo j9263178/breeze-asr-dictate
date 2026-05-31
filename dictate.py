@@ -1032,19 +1032,35 @@ def _toggle_auto():
     else:
         _start_auto_mode()
 
+# 自己追蹤左右 Alt 的狀態,不用 is_pressed(Windows AltGr 會讓兩個同時為 True)
+_lalt_down = False
+_ralt_down = False
+
+def _on_lalt(e):
+    global _lalt_down
+    _lalt_down = (e.event_type == keyboard.KEY_DOWN)
+
+def _on_ralt(e):
+    global _ralt_down
+    _ralt_down = (e.event_type == keyboard.KEY_DOWN)
+
+keyboard.hook_key("left alt",  _on_lalt)
+keyboard.hook_key("right alt", _on_ralt)
+
 def _on_hotkey(event):
     if event.event_type != "down":
         return
-    auto_held = keyboard.is_pressed(AUTO_MODIFIER)
-    ai_held   = keyboard.is_pressed(AI_MODIFIER)
-    if auto_held:
+    # 用自追蹤的狀態,右 Alt 優先
+    if _ralt_down:
+        if not XAI_API_KEY:
+            print("⚠ 未設定 XAI_API_KEY,AI 模式無法使用。"); beep_error(); return
+        _toggle(ai=True)
+    elif _lalt_down:
         if not XAI_API_KEY:
             print("⚠ 未設定 XAI_API_KEY,無法使用自動模式。"); beep_error(); return
         _toggle_auto()
-        return
-    if ai_held and not XAI_API_KEY:
-        print("⚠ 未設定 XAI_API_KEY,AI 模式無法使用。"); beep_error(); return
-    _toggle(ai=ai_held)
+    else:
+        _toggle(ai=False)
 
 keyboard.hook_key(HOTKEY, _on_hotkey, suppress=HOTKEY_SUPPRESS)
 
