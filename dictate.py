@@ -76,7 +76,7 @@ AUTO_CONTEXT     = True        # True = 自動模式也帶剪貼簿脈絡(按下
 # 全自動模式專用 LLM(走 OpenRouter,比 xAI 便宜)
 AUTO_LLM_URL    = "https://openrouter.ai/api/v1/chat/completions"
 AUTO_LLM_KEY    = os.getenv("OPENROUTER_API_KEY", "")
-AUTO_LLM_MODEL  = "google/gemini-2.0-flash-001"   # 快、便宜、中文好;可換 qwen/qwen-2.5-72b-instruct 等
+AUTO_LLM_MODEL  = "openai/gpt-5-nano"             # 快、便宜;可換 google/gemini-2.0-flash-001 等
 
 # ── xAI (Grok) 設定 ───────────────────────────────────────
 XAI_API_KEY    = os.getenv("XAI_API_KEY", "")
