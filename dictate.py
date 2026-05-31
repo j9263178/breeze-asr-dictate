@@ -937,6 +937,9 @@ def _auto_tick():
     _auto_recording = False
     frames = list(_auto_frames)
     _auto_frames = []
+    # 每輪開始 process 時重新快照剪貼簿,讓新複製的內容馬上生效
+    try:    _auto_context = pyperclip.paste()
+    except: pass
 
     if not frames:
         _auto_start_recording(); return
