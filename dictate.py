@@ -104,7 +104,7 @@ AI_TTS_ENGINE = "eleven"                  # "eleven" = ElevenLabs Flash v2.5(雲
                                           # "edge"   = edge-tts(免費 fallback,較機械)
 # ElevenLabs 設定
 ELEVEN_API_KEY = os.getenv("ELEVENLABS_API_KEY", "")
-ELEVEN_MODEL   = "eleven_flash_v2_5"      # 低延遲、支援中文
+ELEVEN_MODEL   = "eleven_v3"              # v3=支援 [laughs][sighs] 等 audio tags(自然);flash=更低延遲但會把 tag 念出來
 ELEVEN_RATE    = 24000
 ELEVEN_VOICE   = "ht0yrHEoOG42OGi3ERZs"   # 你選的聲音;其他:Sarah=EXAVITQu4vr4xnSDxMaL, Lily=pFZP5JQG7iQjIQuC4Bku
 ELEVEN_STABILITY = 0.5
@@ -357,10 +357,18 @@ def _output_ai_text(text: str):
         return
     _clipboard_paste(text, AI_RESTORE_CLIPBOARD)
 
+# 語音用 audio tags(只有 ElevenLabs v3 看得懂),例:[laughs] [sighs] [whispers]
+_AUDIO_TAG_RE = re.compile(
+    r"\[(laughs?|laughter|giggles?|chuckles?|sighs?|exhales?|breathes?|"
+    r"whispers?|clears throat|gasps?|hmm+|sniffs?)\]",
+    re.IGNORECASE,
+)
+
 # ─────────────────────── 文字清理 ────────────────────────
 def _clean_for_typing(text: str) -> str:
-    """打字輸出前:移除 markdown 記號、把換行收成空格。
+    """打字輸出前:移除 markdown 記號、audio tags、把換行收成空格。
     (多行 + 換行用模擬打字送進輸入框會造成游標亂跳、順序顛倒,攤平成單行最穩。)"""
+    text = _AUDIO_TAG_RE.sub("", text)                       # 拿掉 [laughs] 等(不要打進輸入框)
     text = re.sub(r"\[\[\d+\]\]\([^)]*\)", "", text)          # [[1]](url) 引用標記
     text = re.sub(r"\[([^\]]+)\]\([^)]*\)", r"\1", text)      # [文字](url) -> 文字
     text = re.sub(r"^[ \t]*#{1,6}\s*", "", text, flags=re.M)  # 標題 #
@@ -554,10 +562,12 @@ def _speak_cosy(text: str, cancelled=_NO_CANCEL):
         except: pass
 
 def _speak_eleven(text: str, cancelled=_NO_CANCEL):
-    """ElevenLabs Flash v2.5 → streaming PCM → sounddevice 即時播放。"""
+    """ElevenLabs → streaming PCM → sounddevice 即時播放。"""
     url = f"https://api.elevenlabs.io/v1/text-to-speech/{ELEVEN_VOICE}/stream"
-    params = {"output_format": f"pcm_{ELEVEN_RATE}",
-              "optimize_streaming_latency": 4}
+    params = {"output_format": f"pcm_{ELEVEN_RATE}"}
+    # v3 不支援 optimize_streaming_latency;flash 系列才用
+    if "flash" in ELEVEN_MODEL or "turbo" in ELEVEN_MODEL:
+        params["optimize_streaming_latency"] = 4
     body = {
         "text": text,
         "model_id": ELEVEN_MODEL,
