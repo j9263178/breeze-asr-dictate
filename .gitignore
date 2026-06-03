@@ -16,6 +16,13 @@ __pycache__/
 # API 金鑰
 .env
 
+# 個人資料 / 執行產物(對話記憶、TTS 輸出、測試音檔)
+history.json
+memory.json
+last_tts.*
+*.wav
+*.mp3
+
 # 編輯器
 .vscode/
 .idea/

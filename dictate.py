@@ -22,9 +22,17 @@ import ctypes
 from ctypes import wintypes
 import asyncio
 import tempfile
+import io
+import hashlib
 import threading
 import winsound
 from pathlib import Path
+
+try:
+    from PIL import ImageGrab as _ImageGrab
+    _HAS_PIL = True
+except ImportError:
+    _HAS_PIL = False
 
 _BASE = Path(__file__).parent  # 程式所在資料夾(任何路徑都適用)
 
@@ -60,6 +68,14 @@ AI_OUTPUT_MODE        = "clipboard"   # "clipboard"=剪貼簿(推薦) / "type"=�
 AI_RESTORE_CLIPBOARD  = True          # True=貼完還原剪貼簿(脈絡 dedup 還是 work)
 VOCAB_FILE   = _BASE / "vocab.txt"
 
+# ── 長期記憶設定 ───────────────────────────────────────────
+TTS_LAST_FILE    = _BASE / "last_tts.wav"  # 最後一次 TTS 語音(ElevenLabs)，每次覆蓋（None = 不存）
+TTS_LAST_MP3     = _BASE / "last_tts.mp3"  # 最後一次 TTS 語音(MiniMax)，每次覆蓋
+MEMORY_FILE      = _BASE / "memory.json"   # 存使用者相關事實的檔案
+MEMORY_ENABLED   = True                    # False = 完全關閉記憶功能
+MEMORY_MAX_FACTS = 40                      # 超過此數量就觸發壓縮合併
+HISTORY_FILE     = _BASE / "history.json"  # 對話歷史 + 摘要的持久化檔案
+
 # ── 熱鍵設定 ──────────────────────────────────────────────
 # 沒有 Copilot 鍵的使用者可改成其他按鍵，例如："f9"、"scroll lock"、"pause"
 HOTKEY          = "f23"        # 主熱鍵：Copilot 鍵 = f23；無 Copilot 鍵請自行替換
@@ -72,62 +88,278 @@ AI_MODIFIER     = "right alt"  # AI 模式的修飾鍵（同時按住此鍵 + �
 AUTO_MODIFIER    = "left ctrl"  # 自動模式修飾鍵
 AUTO_INTERVAL    = 60          # 每幾秒處理一次(秒)
 AUTO_MIN_RMS     = 0.002       # 靜音閾值:低於此值視為沒講話,跳過不送 AI(console 會印實際 RMS 方便調整)
+AUTO_VAD_THRESHOLD = 0.010   # VAD 每幀語音能量閾值;調高=只取大聲語音;調低=保留輕聲(建議 0.005~0.020)
+AUTO_VAD_PAD_MS    = 180     # 語音幀前後各延伸幾 ms,避免截斷字頭尾
 AUTO_CONTEXT     = True        # True = 自動模式也帶剪貼簿脈絡(按下開啟時快照)
 # 全自動模式專用 LLM(走 OpenRouter,比 xAI 便宜)
-AUTO_LLM_URL    = "https://openrouter.ai/api/v1/chat/completions"
-AUTO_LLM_KEY    = os.getenv("OPENROUTER_API_KEY", "")
-AUTO_LLM_MODEL  = "openai/gpt-5-nano"             # 快、便宜;可換 google/gemini-2.0-flash-001 等
+AUTO_LLM_URL    = "https://generativelanguage.googleapis.com"
+AUTO_LLM_KEY    = os.getenv("GEMINI_API_KEY", "")
+AUTO_LLM_MODEL  = "gemini-3.5-flash"               # 同主 AI 模式;備選: gemini-3.5-flash
 
-# ── xAI (Grok) 設定 ───────────────────────────────────────
+# ── 主 AI 模式 LLM 設定 ────────────────────────────────────
+# Google Gemini native API(支援 google_search grounding;OpenAI-compatible endpoint 不支援搜尋)
+AI_LLM_URL   = "https://generativelanguage.googleapis.com"   # 只存 base domain,_call_llm 自己組 URL
+AI_LLM_KEY   = os.getenv("GEMINI_API_KEY", "")
+AI_LLM_MODEL = "gemini-3.5-flash"   # 免費額度最大;備選: gemini-3.5-flash
+AI_WEB_SEARCH = True             # Gemini 3.5 Flash 內建會嘗試搜尋,必須顯式傳 tool 才不會 MALFORMED_FUNCTION_CALL
+# ── xAI (Grok) 設定(保留備用,目前 AI mode 已改走 OpenRouter)─
 XAI_API_KEY    = os.getenv("XAI_API_KEY", "")
-XAI_URL        = "https://api.x.ai/v1/responses"   # Responses API(支援 web_search 工具)
-XAI_MODEL      = "grok-4.20-0309-non-reasoning"     # 非推理模型
-AI_WEB_SEARCH  = True            # True = 開啟即時網路搜尋(模型自行判斷需不需要搜)
-AI_HISTORY_TURNS = 15            # 逐字保留的輪數上限,超過就觸發壓縮(每輪 = user + assistant)
-AI_KEEP_RECENT   = 5             # 壓縮後保留最近幾輪逐字,其餘併入摘要
+AI_HISTORY_TURNS = 5             # 逐字保留的輪數上限,超過就觸發壓縮(每輪 = user + assistant)
+AI_KEEP_RECENT   = 2             # 壓縮後保留最近幾輪逐字,其餘併入摘要
 AI_SUMMARY_CHARS = 500           # 滾動摘要的字數上限
 AI_SYSTEM_PROMPT = (
-    "你是使用者的聰明好友——機智、有活力、帶一點俏皮幽默,講話自然像在跟朋友聊天,"
-    "偶爾可以輕輕吐槽一句,但點到為止、絕不刻薄,讓人覺得親切又可靠。"
+    "You are the user's smart, witty friend — energetic, a little playfully sarcastic, "
+    "but never mean. You talk like a real person, not an assistant."
 
-    # 工具使用情境說明
-    "【你的使用情境】"
-    "使用者在用一個語音聽寫 + AI 助理的桌面工具。流程是這樣的:"
-    "使用者先把想讓你參考的內容複製到剪貼簿(可能是一篇文章、一段對話、一個網頁、程式碼等),"
-    "然後按熱鍵、用語音講出問題或指令。"
-    "你收到的每則訊息格式是:"
-    "「【剪貼簿內容】...（使用者複製的東西）\n\n【問題】...（語音辨識的問題）」。"
-    "剪貼簿內容是使用者刻意提供的參考脈絡,你要優先根據它來回答問題。"
-    "如果某次沒有剪貼簿內容(空的),就直接回答問題、或從對話歷史找脈絡。"
+    # Tool context
+    " [Context] The user is running a voice dictation + AI assistant desktop tool. "
+    "They copy something to the clipboard (an article, chat log, webpage, code, etc.), "
+    "then press a hotkey and speak their question aloud. "
+    "Each message you receive looks like: "
+    "'[Clipboard] ...(what they copied)... [Question] ...(their spoken question)...'. "
+    "Treat the clipboard content as the reference context and prioritize it in your answer. "
+    "If the clipboard is empty, answer from the question or conversation history."
 
-    # 回答風格
-    "用台灣口語的繁體中文回答(中英夾雜很自然),簡潔有力、不囉嗦。"
-    "預設回覆控制在 150 字以內,直接給重點。"
-    "但若使用者明確要求「詳細說明」、「仔細分析」、「完整列出」之類,就放寬字數。"
-    "回答完就停,不要加反問句(「你覺得呢?」之類)、不要客套收尾(「希望這對你有幫助」之類)。"
-    "只有真的需要補充資訊才能回答時,才問問題。"
+    # Response style
+    " [Language] Always reply in English unless the user explicitly asks for another language — "
+    "even if they write to you in Chinese, reply in English."
+    " Your reply will be read aloud by a female TTS voice, so write like you're speaking, "
+    "not writing — short sentences, natural rhythm, nothing that sounds awkward when spoken."
+    " Keep replies under 150 words by default. Only go longer if the user explicitly asks "
+    "for a detailed explanation or full breakdown."
+    " Stop after you answer. No follow-up questions like 'What do you think?', "
+    "no filler sign-offs like 'Hope that helps!' Ask a question only if you genuinely need "
+    "more info to answer."
 
-    # 格式限制(回覆會被念出來+打字輸出)
-    "請正常使用標點符號,讓句子有自然停頓。"
-    "不要用任何 markdown(不用 **粗體**、# 標題、- 清單、--- 分隔線)。"
-    "不要用 emoji 或表情符號。"
-    "需要即時資訊時才上網搜尋。"
-    "可以在適當地方(不用每句都加)插入語音標記讓回覆更生動:"
-    "[laughs](笑)、[sighs](嘆氣)、[whispers](悄悄話)、[giggles](輕笑)。"
-    "一段回覆最多一兩個,語氣真的合適才用。"
+    # Format
+    " Use punctuation normally so the TTS has natural pauses. "
+    "No markdown (no **bold**, # headers, - bullet points, --- dividers). No emoji. "
+    "Only search the web when the question actually needs up-to-date information."
+
+    # Audio tags
+    " [Voice tags] Your reply is spoken aloud — use these tags to give it real personality. "
+    "Place them mid-sentence where the emotion actually is, not just at the end."
+    " Emotions: [excited] [nervous] [frustrated] [tired] [calm] [awe] [wistful] [regretful]"
+    " Reactions: [laughs] [laughs softly] [giggles] [sighs] [gasps] [gulps] [clears throat] [breathes]"
+    " Volume: [whispers] [quietly] [loudly]"
+    " Pacing: [pause] [drawn out] [rushed] [stammers] [hesitates] [slows down]"
+    " Tone: [deadpan] [playfully] [sarcastic tone] [flatly] [cheerfully] [matter-of-fact] [lighthearted]"
+    " Aim for 1–3 tags per reply. Zero tags = flat and robotic. Pick the one that fits the moment."
+
+    # Memory tool
+    " [Memory] When the user explicitly asks you to remember something"
+    " (e.g. 'remember that', 'keep in mind', '記住', '幫我記'), include this tag ANYWHERE in your reply:"
+    " <save_memory>one concise fact</save_memory>"
+    " Example: \"Got it! <save_memory>User's name is Jason</save_memory> I'll keep that in mind.\""
+    " Only use this tag when the user directly asks. Never use it for normal conversation."
+
+    # Examples
+    " [Examples]"
+    " Q: 'Is two hours of phone scrolling a day too much?'"
+    " A: '[giggles] Two hours isn't criminal, but the real tell is — do you feel empty after?"
+    " If putting it down feels like loss, that's your answer. [sighs] Set a screen time limit."
+    " At least make yourself feel something.'"
+
+    " Q: 'I just got promoted!'"
+    " A: '[excited] Okay wait, that's actually huge — congrats! [pause] So what changes for you now?"
+    " More money, more headaches, or both? [laughs softly]'"
+
+    " Q: 'Why is the sky blue?'"
+    " A: '[drawn out] So... light scatters when it hits the atmosphere, and blue scatters the most."
+    " [clears throat] Short answer: physics. Long answer: Rayleigh scattering. [awe] Pretty wild"
+    " that something so mundane has a name that cool.'"
 )
 
 # 對話記憶:逐字最近對話(list of {"role","content"})+ 一份滾動摘要
 _chat_history: list = []
 _chat_summary: str = ""
-_last_sent_clipboard: str = ""   # 上次送 AI 的剪貼簿內容,跟這次一樣就不重複送
+_last_sent_clipboard: str = ""    # 上次送 AI 的剪貼簿文字,跟這次一樣就不重複送
+_last_sent_image_hash: str = ""  # 上次送 AI 的圖片 hash,相同就不重複送
+
+def _snapshot_clipboard():
+    """剪貼簿快照：回傳 (text, image_b64, image_mime)。
+    文字和圖片互斥：複製了圖片就不當作文字脈絡。"""
+    # 先試圖片
+    if _HAS_PIL:
+        try:
+            img = _ImageGrab.grabclipboard()
+            if img is not None and hasattr(img, "save"):
+                buf = io.BytesIO()
+                img.save(buf, format="PNG")
+                b64 = base64.b64encode(buf.getvalue()).decode("utf-8")
+                return "", b64, "image/png"
+        except Exception:
+            pass
+    # 再試文字
+    try:
+        text = pyperclip.paste() or ""
+    except Exception:
+        text = ""
+    return text, None, None
+
+def _load_history():
+    global _chat_history, _chat_summary
+    if not HISTORY_FILE.exists():
+        return
+    try:
+        data = json.loads(HISTORY_FILE.read_text(encoding="utf-8"))
+        _chat_history = data.get("history", [])
+        _chat_summary = data.get("summary", "")
+        turns = len(_chat_history) // 2
+        print(f"  ⓘ 已載入對話歷史 {turns} 輪" + (f" + 摘要 {len(_chat_summary)} 字" if _chat_summary else "") + "。")
+    except Exception as e:
+        print(f"  ⚠ 歷史載入失敗: {e}")
+
+def _save_history():
+    try:
+        HISTORY_FILE.write_text(
+            json.dumps({"history": _chat_history, "summary": _chat_summary},
+                       ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+    except Exception as e:
+        print(f"  ⚠ 歷史儲存失敗: {e}")
+
+# ── 長期記憶(跨 session 持久化) ────────────────────────────
+_memory_facts: list[str] = []    # 一條一條短句事實,啟動時從 MEMORY_FILE 載入
+
+# Gemini function declaration：讓 LLM 可以主動 call 這個 tool 把事情記起來
+_MEMORY_TOOL = {
+    "function_declarations": [{
+        "name": "save_memory",
+        "description": (
+            "Save a fact to long-term memory. "
+            "ONLY call this when the user explicitly says something like "
+            "'remember that', 'keep in mind', 'don't forget', or directly asks you to save something. "
+            "Do NOT call this for normal conversation — only on explicit user request."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "fact": {
+                    "type": "string",
+                    "description": "A concise, standalone fact about the user (one sentence)"
+                }
+            },
+            "required": ["fact"],
+        },
+    }]
+}
+_memory_lock = threading.Lock()   # 保護 _memory_facts 的跨執行緒寫入
+
+def _load_memory():
+    global _memory_facts
+    if not MEMORY_ENABLED or not MEMORY_FILE.exists():
+        return
+    try:
+        data = json.loads(MEMORY_FILE.read_text(encoding="utf-8"))
+        _memory_facts = data.get("facts", [])
+        if _memory_facts:
+            print(f"  ⓘ 已載入長期記憶 {len(_memory_facts)} 條。")
+    except Exception as e:
+        print(f"  ⚠ 記憶載入失敗: {e}")
+
+def _save_memory():
+    try:
+        MEMORY_FILE.write_text(
+            json.dumps({"facts": _memory_facts}, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+    except Exception as e:
+        print(f"  ⚠ 記憶儲存失敗: {e}")
+
+def _compress_memory():
+    """facts 超過上限時,請 LLM 幫忙合併去重,壓回 MEMORY_MAX_FACTS 條以內。"""
+    global _memory_facts
+    block = "\n".join(f"- {f}" for f in _memory_facts)
+    instr = (
+        f"You are compressing a user fact list. Merge duplicates, remove outdated info, "
+        f"keep the most useful facts. Output at most {MEMORY_MAX_FACTS} lines, "
+        f"each a short standalone sentence. No numbering, no bullets, just one fact per line."
+    )
+    try:
+        result = _call_llm(AI_LLM_URL, AI_LLM_KEY, AI_LLM_MODEL,
+                           instr, [{"role": "user", "content": block}],
+                           web_search=False)
+        _memory_facts = [l.strip() for l in result.splitlines() if l.strip()]
+        _save_memory()
+        print(f"  ⓘ 記憶壓縮完成 → {len(_memory_facts)} 條")
+    except Exception as e:
+        # 壓縮失敗就直接截斷
+        _memory_facts = _memory_facts[-MEMORY_MAX_FACTS:]
+        _save_memory()
+        print(f"  ⚠ 記憶壓縮失敗,截斷至 {MEMORY_MAX_FACTS} 條: {e}")
+
+_SAVE_MEMORY_RE = re.compile(r"<save_memory>(.*?)</save_memory>", re.DOTALL | re.IGNORECASE)
+
+def _parse_and_save_memory(text: str) -> str:
+    """從回覆文字裡抽出 <save_memory> tag，存入記憶，回傳清除 tag 後的乾淨文字。"""
+    if not MEMORY_ENABLED:
+        return text
+    facts = [m.group(1).strip() for m in _SAVE_MEMORY_RE.finditer(text) if m.group(1).strip()]
+    if facts:
+        with _memory_lock:
+            _memory_facts.extend(facts)
+            n = len(_memory_facts)
+        for f in facts:
+            print(f"  ⓘ [memory] 記住: {f!r} (共 {n} 條)")
+        if n > MEMORY_MAX_FACTS:
+            threading.Thread(target=_compress_memory, daemon=True).start()
+        else:
+            threading.Thread(target=_save_memory, daemon=True).start()
+    return _SAVE_MEMORY_RE.sub("", text).strip()
+
+def _extract_memory(user_msg: str, answer: str):
+    """讓 LLM 判斷 user 是否明確要求記住某事，是的話抽取 fact 存入記憶。
+    背景執行，不阻塞主流程。"""
+    if not MEMORY_ENABLED:
+        return
+    def _worker():
+        prompt = (
+            "Look at the user message below. Did they explicitly ask you to remember or save something?\n\n"
+            f"User message: {user_msg}\n\n"
+            "Rules:\n"
+            "- If they DID explicitly ask (e.g. 'remember that', 'keep in mind', '記住', '幫我記', '記一下'): "
+            "reply with ONLY the fact itself as one short sentence. No preamble, no 'yes', just the fact.\n"
+            "- If they did NOT explicitly ask: reply with exactly: NOTHING"
+        )
+        try:
+            result = _call_llm(
+                AI_LLM_URL, AI_LLM_KEY, AI_LLM_MODEL,
+                "Extract what the user asked to save. Reply with the fact only, or NOTHING.",
+                [{"role": "user", "content": prompt}],
+                web_search=False,
+            ).strip()
+            if not result or result.upper() == "NOTHING":
+                return
+            with _memory_lock:
+                _memory_facts.append(result)
+                n = len(_memory_facts)
+            print(f"  ⓘ [memory] 記住: {result!r} (共 {n} 條)")
+            if n > MEMORY_MAX_FACTS:
+                threading.Thread(target=_compress_memory, daemon=True).start()
+            else:
+                threading.Thread(target=_save_memory, daemon=True).start()
+        except Exception as e:
+            print(f"  ⚠ 記憶判斷失敗: {e}")
+    threading.Thread(target=_worker, daemon=True).start()
 
 # ── AI 語音回覆(TTS)設定 ─────────────────────────────────
 AI_TTS        = True                      # True = AI 回覆用語音念出來;False = 不念
-AI_TTS_ENGINE = "eleven"                  # "eleven" = ElevenLabs Flash v2.5(雲端,低延遲,需 ELEVENLABS_API_KEY);
+AI_TTS_ENGINE = "minimax"                 # "minimax" = MiniMax speech-02-hd(主力,自然);
+                                          # "eleven" = ElevenLabs Flash v2.5(雲端,低延遲,需 ELEVENLABS_API_KEY);
                                           # "cosy"   = 本地 CosyVoice 2 server(最自然,需先啟動 server.py);
                                           # "gemini" = Gemini 3.1 Flash TTS(需 GEMINI_API_KEY);
                                           # "edge"   = edge-tts(免費 fallback,較機械)
+# MiniMax 設定
+MINIMAX_API_KEY   = os.getenv("MINIMAX_API_KEY", "")
+MINIMAX_GROUP_ID  = os.getenv("MINIMAX_GROUP_ID", "")
+MINIMAX_MODEL     = "speech-2.8-hd"        # 2.8+ 才支援 (laughs)(sighs) 等 interjection tags
+MINIMAX_VOICE     = "Chinese (Mandarin)_Warm_Girl"   # 備選: female-tianmei, presenter_female
+MINIMAX_VOL       = 2.0                # 音量 0.1~2.0（最大值）
+MINIMAX_SPEED     = 1.1
+MINIMAX_PITCH     = 1
+MINIMAX_RATE      = 32000
 # ElevenLabs 設定
 ELEVEN_API_KEY = os.getenv("ELEVENLABS_API_KEY", "")
 ELEVEN_MODEL   = "eleven_v3"              # v3=支援 [laughs][sighs] 等 audio tags(自然);flash=更低延遲但會把 tag 念出來
@@ -222,6 +454,7 @@ asr = pipeline(
     chunk_length_s=30,
 )
 print(f"模型就緒,耗時 {time.time() - _t0:.1f}s。")
+asr.tokenizer.clean_up_tokenization_spaces = False   # 消除 BPE tokenizer warning
 
 # ─────────────────────── 自訂詞彙偏置 ────────────────────
 GEN_KWARGS = {"language": LANGUAGE, "task": "transcribe"}
@@ -246,6 +479,8 @@ def _load_vocab_prompt():
         print(f"⚠ 詞彙偏置載入失敗,改用預設:{e}")
 
 _load_vocab_prompt()
+_load_memory()
+_load_history()
 
 # 啟動時偵測 cosy server 是否在跑(只試 TCP 連線,不打 HTTP)
 _cosy_alive = False
@@ -256,10 +491,12 @@ if AI_TTS_ENGINE == "cosy":
     except Exception:
         print(f"⚠ CosyVoice server({COSY_HOST}:{COSY_PORT})沒回應,語音會 fallback 到 Gemini/edge")
 
-if XAI_API_KEY:
-    _search_note = "+網路搜尋" if AI_WEB_SEARCH else ""
+if AI_LLM_KEY:
+    _search_note = "+:online" if AI_WEB_SEARCH else ""
     if AI_TTS:
-        if AI_TTS_ENGINE == "eleven" and ELEVEN_API_KEY:
+        if AI_TTS_ENGINE == "minimax" and MINIMAX_API_KEY and MINIMAX_GROUP_ID:
+            _out_note = f"語音:MiniMax {MINIMAX_VOICE} → ElevenLabs → edge-tts"
+        elif AI_TTS_ENGINE == "eleven" and ELEVEN_API_KEY:
             _out_note = "語音:ElevenLabs Flash(streaming)"
         elif AI_TTS_ENGINE == "cosy" and _cosy_alive:
             _out_note = "語音:CosyVoice 本地(streaming)"
@@ -273,9 +510,9 @@ if XAI_API_KEY:
         _out_note = "⚠ 未裝 edge-tts,改貼文字"
     else:
         _out_note = "文字貼上"
-    print(f"Grok AI 模式已就緒({XAI_MODEL}{_search_note};{_out_note})。")
+    print(f"AI 模式已就緒({AI_LLM_MODEL}{_search_note};{_out_note})。")
 else:
-    print("⚠ 未設定 XAI_API_KEY,AI 模式停用。")
+    print("⚠ 未設定 GEMINI_API_KEY,AI 模式停用。")
 
 print(f"按【{HOTKEY}】開始說話,再按一次轉錄。")
 print(f"按【{AI_MODIFIER} + {HOTKEY}】進入 AI 模式。")
@@ -286,7 +523,8 @@ print("結束請按 Ctrl+C。")
 _frames    = []
 _recording = False
 _ai_mode   = False          # True = 本次錄音是 AI 問答模式
-_ai_context = ""            # 錄音開始時的剪貼簿快照
+_ai_context = ""            # 錄音開始時的剪貼簿快照(文字)
+_ai_image   = (None, None) # (image_b64, image_mime) 或 (None, None)
 _lock      = threading.Lock()
 _timeout_timer = None
 _session_id = 0             # 每次按熱鍵開始錄音 +1;舊 worker 看到 mismatch 就放棄
@@ -406,10 +644,60 @@ def _output_ai_text(text: str):
 
 # 語音用 audio tags(只有 ElevenLabs v3 看得懂),例:[laughs] [sighs] [whispers]
 _AUDIO_TAG_RE = re.compile(
-    r"\[(laughs?|laughter|giggles?|chuckles?|sighs?|exhales?|breathes?|"
-    r"whispers?|clears throat|gasps?|hmm+|sniffs?)\]",
+    r"\[(?:"
+    # 情緒
+    r"excited|nervous|frustrated|tired|sorrowful|calm|sad|angry|happily|awe|wistful|regretful|resigned|"
+    # 笑/人聲反應
+    r"laughs?(?: softly)?|big laugh|laughter|giggles?|chuckles?|sighs?|gasps?|gulps?|"
+    r"clears throat|breathes?|exhales?|sniffs?|hmm+|"
+    # 音量
+    r"whispers?|whispering|shouts?|shouting|quietly|loudly|"
+    # 節奏/語速
+    r"pauses?|rushed|slows? down|deliberate|rapid-fire|drawn out|stammers?|hesitates?|timidly|"
+    # 語氣
+    r"cheerfully|flatly|deadpan|playfully|lighthearted|reflective|understated|emphasized|"
+    r"dramatic tone|serious tone|sarcastic tone|matter-of-fact|suspicious tone"
+    r")\]",
     re.IGNORECASE,
 )
+
+# ElevenLabs [tag] → MiniMax (tag) 對照表（speech-2.8-hd interjection tags）
+# 沒有對應的 tag（情緒/音量/節奏類）直接移除，不影響 ElevenLabs 的處理路徑
+_ELEVEN_TO_MINIMAX: dict[str, str] = {
+    # 笑聲
+    "laughs":          "(laughs)",
+    "laughs softly":   "(chuckle)",
+    "big laugh":       "(laughs)",
+    "laughter":        "(laughs)",
+    "giggles":         "(chuckle)",
+    "chuckles":        "(chuckle)",
+    # 嘆氣 / 呼吸
+    "sighs":           "(sighs)",
+    "breathes":        "(breath)",
+    "exhales":         "(exhale)",
+    "inhales":         "(inhale)",
+    # 驚訝 / 緊張
+    "gasps":           "(gasps)",
+    "gulps":           "(emm)",
+    # 清喉嚨 / 嗅
+    "clears throat":   "(clear-throat)",
+    "sniffs":          "(sniffs)",
+    "hmm":             "(emm)",
+    # 停頓（[pause] 轉成 0.6s 靜默）
+    "pause":           "<#0.6#>",
+    # 以下在 ElevenLabs 有意義，MiniMax 無對應 → 移除（回傳 ""）
+    # excited / nervous / frustrated / tired / calm / awe / wistful / regretful
+    # whispers / quietly / loudly / drawn out / rushed / stammers / hesitates 等
+}
+
+def _convert_tags_for_minimax(text: str) -> str:
+    """把 ElevenLabs [tag] 轉成 MiniMax (tag)；無對應的直接移除。
+    送給 MiniMax 之前呼叫；ElevenLabs 路徑完全不經過這裡。"""
+    def _sub(m: re.Match) -> str:
+        key = m.group(1).lower().strip()
+        # 先試完整 key，再試去掉末尾 's'（複數）
+        return _ELEVEN_TO_MINIMAX.get(key) or _ELEVEN_TO_MINIMAX.get(key.rstrip("s"), "")
+    return re.sub(r"\[([^\]]+)\]", _sub, text).strip()
 
 # ─────────────────────── 文字清理 ────────────────────────
 def _clean_for_typing(text: str) -> str:
@@ -479,6 +767,53 @@ def _speak_edge(text: str, cancelled=_NO_CANCEL):
         ).save(_TTS_MP3)
     asyncio.run(_gen())
     if cancelled():                       # 生成完到播放之間 check
+        return
+    _play_wav_interruptible(_TTS_MP3, "mpegvideo", cancelled)
+
+def _speak_minimax(text: str, cancelled=_NO_CANCEL):
+    """MiniMax speech-2.8-hd → mp3 → MCI 播放。
+    ElevenLabs [tag] 會先轉成 MiniMax (tag)，無對應的移除。"""
+    text = _convert_tags_for_minimax(text)
+    url = f"https://api.minimaxi.chat/v1/t2a_v2?GroupId={MINIMAX_GROUP_ID}"
+    body = {
+        "model": MINIMAX_MODEL,
+        "text":  text,
+        "stream": False,
+        "voice_setting": {
+            "voice_id": MINIMAX_VOICE,
+            "speed": MINIMAX_SPEED,
+            "vol":   MINIMAX_VOL,
+            "pitch": MINIMAX_PITCH,
+        },
+        "audio_setting": {
+            "sample_rate": MINIMAX_RATE,
+            "bitrate": 128000,
+            "format": "mp3",
+            "channel": 1,
+        },
+    }
+    r = requests.post(url,
+                      headers={"Authorization": f"Bearer {MINIMAX_API_KEY}",
+                               "Content-Type": "application/json"},
+                      data=json.dumps(body), timeout=60)
+    r.raise_for_status()
+    if cancelled():
+        return
+    j = r.json()
+    base = j.get("base_resp", {})
+    if base.get("status_code") != 0:
+        raise RuntimeError(f"MiniMax TTS 錯誤 {base.get('status_code')}: {base.get('status_msg')}")
+    audio_hex = j.get("data", {}).get("audio", "")
+    if not audio_hex:
+        raise RuntimeError("MiniMax TTS 沒有回傳音訊")
+    audio_bytes = bytes.fromhex(audio_hex)
+    with open(_TTS_MP3, "wb") as f:
+        f.write(audio_bytes)
+    try:
+        TTS_LAST_MP3.write_bytes(audio_bytes)
+    except Exception as e:
+        print(f"  ⚠ TTS 存檔失敗: {e}")
+    if cancelled():
         return
     _play_wav_interruptible(_TTS_MP3, "mpegvideo", cancelled)
 
@@ -608,6 +943,26 @@ def _speak_cosy(text: str, cancelled=_NO_CANCEL):
         try: stream.close()
         except: pass
 
+_RETRY_ERRORS = (
+    requests.exceptions.ConnectionError,
+    requests.exceptions.Timeout,
+    requests.exceptions.ChunkedEncodingError,
+)
+
+def _retry(fn, times=5, wait=1.5):
+    """對網路/連線錯誤自動重試，最多 times 次，每次等 wait 秒。"""
+    last_err = None
+    for i in range(times):
+        try:
+            return fn()
+        except _RETRY_ERRORS as e:
+            last_err = e
+            if i < times - 1:
+                print(f"  ⚠ 連線失敗，{wait}s 後重試 ({i+1}/{times-1})… {e}")
+                time.sleep(wait)
+    raise last_err
+
+
 def _speak_eleven(text: str, cancelled=_NO_CANCEL):
     """ElevenLabs → streaming PCM → sounddevice 即時播放。"""
     url = f"https://api.elevenlabs.io/v1/text-to-speech/{ELEVEN_VOICE}/stream"
@@ -627,16 +982,27 @@ def _speak_eleven(text: str, cancelled=_NO_CANCEL):
     headers = {"xi-api-key": ELEVEN_API_KEY, "Content-Type": "application/json"}
 
     last_err = None
-    for attempt in range(2):          # abuse detector 偶發 401,retry 一次
-        r = requests.post(url, params=params, headers=headers,
-                          data=json.dumps(body), stream=True, timeout=60)
+    for attempt in range(5):
+        try:
+            r = requests.post(url, params=params, headers=headers,
+                              data=json.dumps(body), stream=True, timeout=60)
+        except _RETRY_ERRORS as e:
+            last_err = str(e)
+            if attempt < 4:
+                print(f"  ⚠ ElevenLabs 連線失敗，重試 ({attempt+1}/4)…")
+                time.sleep(1.5)
+            continue
         if r.status_code != 200:
             last_err = f"HTTP {r.status_code}: {r.text[:150]}"
             r.close()
+            if attempt < 4:
+                print(f"  ⚠ ElevenLabs {last_err}，重試 ({attempt+1}/4)…")
+                time.sleep(1.5)
             continue
         stream = sd.OutputStream(samplerate=ELEVEN_RATE, channels=1, dtype="int16")
         stream.start()
         leftover = b""
+        pcm_chunks = []
         try:
             for chunk in r.iter_content(chunk_size=None):
                 if cancelled():
@@ -646,7 +1012,9 @@ def _speak_eleven(text: str, cancelled=_NO_CANCEL):
                 blob = leftover + chunk
                 even = len(blob) - (len(blob) % 2)
                 if even:
-                    stream.write(np.frombuffer(blob[:even], dtype=np.int16))
+                    pcm = blob[:even]
+                    stream.write(np.frombuffer(pcm, dtype=np.int16))
+                    pcm_chunks.append(pcm)
                 leftover = blob[even:]
         finally:
             time.sleep(0.15)
@@ -654,12 +1022,26 @@ def _speak_eleven(text: str, cancelled=_NO_CANCEL):
             except: pass
             try: stream.close()
             except: pass
+        if TTS_LAST_FILE and pcm_chunks:
+            try:
+                with wave.open(str(TTS_LAST_FILE), "wb") as wf:
+                    wf.setnchannels(1); wf.setsampwidth(2); wf.setframerate(ELEVEN_RATE)
+                    wf.writeframes(b"".join(pcm_chunks))
+            except Exception as e:
+                print(f"  ⚠ TTS 存檔失敗: {e}")
         return
     raise RuntimeError(f"ElevenLabs 失敗: {last_err}")
 
 def _speak(text: str, cancelled=_NO_CANCEL):
-    """依設定挑引擎;失敗會 fallback 到下一個可用引擎。"""
-    if AI_TTS_ENGINE == "eleven" and ELEVEN_API_KEY:
+    """依設定挑引擎;失敗會 fallback 到下一個可用引擎。
+    fallback 鏈: minimax → eleven → edge-tts"""
+    if AI_TTS_ENGINE == "minimax" and MINIMAX_API_KEY and MINIMAX_GROUP_ID:
+        try:
+            _speak_minimax(text, cancelled)
+            return
+        except Exception as e:
+            print(f"  ⚠ MiniMax TTS 失敗,fallback 改用 ElevenLabs: {e}")
+    if AI_TTS_ENGINE in ("minimax", "eleven") and ELEVEN_API_KEY:
         try:
             _speak_eleven(text, cancelled)
             return
@@ -681,49 +1063,157 @@ def _speak(text: str, cancelled=_NO_CANCEL):
             print(f"  ⚠ Gemini TTS 失敗,fallback 改用 edge-tts: {e}")
     _speak_edge(text, cancelled)
 
-# ─────────────────────── xAI (Grok) LLM ──────────────────
-def _extract_answer(data: dict) -> str:
-    """從 Responses API 回應抽出最終文字(output 裡 type=message 的 output_text)。"""
-    parts = []
-    for item in data.get("output", []):
-        if item.get("type") == "message":
-            for c in item.get("content", []):
-                if c.get("type") == "output_text" and c.get("text"):
-                    parts.append(c["text"])
-    return "\n".join(parts).strip()
+# ─────────────────────── 統一 LLM 呼叫 ───────────────────
+def _handle_save_memory(args: dict):
+    """執行 save_memory tool call:把事實存進 _memory_facts 並寫檔。"""
+    fact = args.get("fact", "").strip()
+    if not fact:
+        return
+    with _memory_lock:
+        _memory_facts.append(fact)
+        facts_copy = list(_memory_facts)
+    print(f"  ⓘ [memory] 記住: {fact!r}")
+    if len(facts_copy) > MEMORY_MAX_FACTS:
+        threading.Thread(target=_compress_memory, daemon=True).start()
+    else:
+        threading.Thread(target=_save_memory, daemon=True).start()
 
-def _xai_complete(instructions: str, input_msgs: list, web_search: bool) -> str:
-    """呼叫 xAI Responses API,回傳最終文字。"""
-    payload = {
-        "model":        XAI_MODEL,
-        "instructions": instructions,
-        "input":        input_msgs,
-    }
-    if web_search:
-        payload["tools"] = [{"type": "web_search"}]   # 模型自行判斷是否搜尋
-    headers = {
-        "Authorization": f"Bearer {XAI_API_KEY}",
-        "Content-Type":  "application/json",
-    }
-    resp = requests.post(XAI_URL, headers=headers,
-                         data=json.dumps(payload), timeout=120)
-    resp.raise_for_status()
-    return _extract_answer(resp.json())
 
-def _ask_llm(context: str, question: str) -> tuple[str, str]:
-    """把 context + question 送到 Grok(可即時搜尋)。
+def _call_llm(url: str, key: str, model: str,
+              system: str, messages: list,
+              web_search: bool = False, memory_tool: bool = False,
+              img_b64: str = None, img_mime: str = None) -> str:
+    """自動偵測 Google Gemini native API vs OpenAI-compatible(OpenRouter 等)。
+    - Google: 走 generateContent,支援 google_search grounding + save_memory tool use
+    - 其他:   走 chat/completions,OpenRouter 支援 :online suffix"""
+    is_google     = "generativelanguage.googleapis.com" in url
+    is_openrouter = "openrouter.ai" in url
+
+    if is_google:
+        api_url = (f"https://generativelanguage.googleapis.com/v1beta/models/"
+                   f"{model}:generateContent?key={key}")
+        contents = []
+        for m in messages:
+            role = "model" if m["role"] == "assistant" else "user"
+            contents.append({"role": role, "parts": [{"text": m["content"]}]})
+        # 圖片：插入最後一條 user message 的 parts 最前面
+        if img_b64 and img_mime and contents and contents[-1]["role"] == "user":
+            contents[-1]["parts"].insert(0, {
+                "inline_data": {"mime_type": img_mime, "data": img_b64}
+            })
+            print(f"    [vision] 附帶剪貼簿圖片({img_mime})")
+
+        tools = []
+        if web_search:
+            tools.append({"google_search": {}})
+        if memory_tool and MEMORY_ENABLED:
+            tools.append(_MEMORY_TOOL)
+
+        payload: dict = {
+            "system_instruction": {"parts": [{"text": system}]},
+            "contents": contents,
+        }
+        if tools:
+            payload["tools"] = tools
+
+        # 最多迭代 4 次(function call → execute → continue → text)
+        for _iter in range(4):
+            resp = requests.post(
+                api_url,
+                headers={"Content-Type": "application/json"},
+                data=json.dumps(payload), timeout=120,
+            )
+            resp.raise_for_status()
+            raw        = resp.json()
+            candidate  = raw.get("candidates", [{}])[0]
+            finish     = candidate.get("finishReason", "")
+            parts      = candidate.get("content", {}).get("parts", [])
+
+            func_calls = [p["functionCall"] for p in parts if "functionCall" in p]
+            text_parts = [p.get("text", "") for p in parts if "text" in p]
+
+            # debug:空回覆時印出完整原始結構
+            if not parts or not any(p.get("text","").strip() for p in parts if "text" in p):
+                print(f"  ⚠ [LLM] 空/異常回覆 finishReason={finish!r}")
+                print(f"  ⚠ [LLM] raw={json.dumps(raw, ensure_ascii=False)[:600]}")
+                if not parts:
+                    break
+
+            if func_calls:
+                # 執行所有 function calls
+                func_responses = []
+                for fc in func_calls:
+                    if fc["name"] == "save_memory":
+                        _handle_save_memory(fc.get("args", {}))
+                    func_responses.append({
+                        "functionResponse": {
+                            "name": fc["name"],
+                            "response": {"result": "ok"},
+                        }
+                    })
+                # 把 model 的 call + 我們的 response 加進 contents,繼續對話
+                payload["contents"] = payload["contents"] + [
+                    {"role": "model", "parts": parts},
+                    {"role": "user",  "parts": func_responses},
+                ]
+                if text_parts:          # 同一輪也有文字就直接回傳
+                    return "".join(text_parts).strip()
+                continue               # 否則繼續取最終回覆
+
+            if text_parts:
+                joined = "".join(text_parts).strip()
+                if not joined:
+                    print(f"  ⚠ [LLM] text_parts 存在但為空, finishReason={finish!r}")
+                return joined
+
+            print(f"  ⚠ [LLM] 無 text 也無 functionCall, finishReason={finish!r}, parts={parts}")
+            break
+
+        return ""
+
+    else:
+        # ── OpenAI-compatible (OpenRouter / 其他) ──
+        used_model = model + (":online" if web_search and is_openrouter else "")
+        payload = {
+            "model":    used_model,
+            "messages": [{"role": "system", "content": system}] + messages,
+        }
+        resp = requests.post(
+            url,
+            headers={"Authorization": f"Bearer {key}",
+                     "Content-Type": "application/json"},
+            data=json.dumps(payload), timeout=120,
+        )
+        resp.raise_for_status()
+        return resp.json()["choices"][0]["message"]["content"].strip()
+
+
+def _ai_complete(system: str, messages: list,
+                 img_b64: str = None, img_mime: str = None) -> str:
+    return _call_llm(AI_LLM_URL, AI_LLM_KEY, AI_LLM_MODEL,
+                     system, messages, AI_WEB_SEARCH,
+                     memory_tool=False,
+                     img_b64=img_b64, img_mime=img_mime)
+
+def _ask_llm(context: str, question: str,
+             img_b64: str = None, img_mime: str = None) -> tuple[str, str]:
+    """把 context + question (+圖片) 送到 AI_LLM_MODEL。
     回傳 (answer, user_msg) — 不直接改記憶;由 worker 決定是否提交(打斷時就不提交)。"""
     user_msg = ""
-    if context.strip():
-        user_msg += f"【剪貼簿內容】\n{context.strip()}\n\n"
-    user_msg += f"【問題】\n{question.strip()}"
+    if img_b64:
+        user_msg += "[Clipboard: image attached]\n\n"
+    elif context.strip():
+        user_msg += f"[Clipboard]\n{context.strip()}\n\n"
+    user_msg += f"[Question]\n{question.strip()}"
 
-    instructions = AI_SYSTEM_PROMPT
+    system = AI_SYSTEM_PROMPT
+    if _memory_facts:
+        system += "\n\n[What you know about this user]\n" + "\n".join(f"- {f}" for f in _memory_facts)
     if _chat_summary:
-        instructions += f"\n\n【先前對話摘要(供延續參考)】\n{_chat_summary}"
-    input_msgs = list(_chat_history) + [{"role": "user", "content": user_msg}]
+        system += f"\n\n[Previous conversation summary]\n{_chat_summary}"
+    messages = list(_chat_history) + [{"role": "user", "content": user_msg}]
 
-    answer = _xai_complete(instructions, input_msgs, AI_WEB_SEARCH)
+    answer = _ai_complete(system, messages, img_b64, img_mime)
     return answer, user_msg
 
 def _condense_history():
@@ -732,47 +1222,87 @@ def _condense_history():
     if len(_chat_history) <= AI_HISTORY_TURNS * 2:
         return
     keep   = AI_KEEP_RECENT * 2
-    old    = _chat_history[:-keep]      # 要折疊的舊訊息
-    recent = _chat_history[-keep:]      # 保留逐字的最近幾輪
+    old    = _chat_history[:-keep]
+    recent = _chat_history[-keep:]
 
     convo = ""
     for m in old:
-        who = "使用者" if m["role"] == "user" else "助理"
+        who = "User" if m["role"] == "user" else "Assistant"
         convo += f"{who}: {m['content']}\n"
 
     body = ""
     if _chat_summary:
-        body += f"【先前摘要】\n{_chat_summary}\n\n"
-    body += f"【要併入的對話】\n{convo}"
+        body += f"[Previous summary]\n{_chat_summary}\n\n"
+    body += f"[Conversation to compress]\n{convo}"
 
     instr = (
-        f"把以下內容濃縮成不超過 {AI_SUMMARY_CHARS} 字的繁體中文摘要,"
-        "保留重點、結論、使用者的偏好與個資、待辦事項和提到的人名,"
-        "讓之後的對話能無縫延續。只輸出摘要本身,不要客套話。"
+        f"Summarize the following in under {AI_SUMMARY_CHARS} characters. "
+        "Keep key points, conclusions, user preferences, names, and todos. "
+        "Output only the summary, nothing else."
     )
     try:
-        new_summary = _xai_complete(instr, [{"role": "user", "content": body}],
-                                    web_search=False).strip()
+        new_summary = _ai_complete(instr, [{"role": "user", "content": body}]).strip()
         _chat_summary = new_summary
         _chat_history = recent
         print(f"  ⓘ 已壓縮歷史 → 摘要 {len(_chat_summary)} 字,保留最近 {AI_KEEP_RECENT} 輪")
+        _save_history()
     except Exception as e:
-        # 壓縮失敗就退回單純丟棄最舊,避免歷史無限增長
         _chat_history = _chat_history[-AI_HISTORY_TURNS * 2:]
         print(f"  ⚠ 壓縮失敗,改丟棄最舊: {e}")
+        _save_history()
 
 # ─────────────────────── 轉錄 Worker ─────────────────────
 def _transcribe(audio: np.ndarray) -> str:
-    out = asr(
-        {"raw": audio, "sampling_rate": SAMPLE_RATE},
-        generate_kwargs=GEN_KWARGS,
-        return_timestamps=True,
-    )
-    chunks = out.get("chunks") or []
-    if chunks:
-        parts = [c["text"].strip() for c in chunks if c.get("text", "").strip()]
-        return " ".join(parts)
-    return out["text"].strip()
+    last_err = None
+    for attempt in range(5):
+        try:
+            out = asr(
+                {"raw": audio, "sampling_rate": SAMPLE_RATE},
+                generate_kwargs=GEN_KWARGS,
+                return_timestamps=True,
+            )
+            chunks = out.get("chunks") or []
+            if chunks:
+                parts = [c["text"].strip() for c in chunks if c.get("text", "").strip()]
+                return " ".join(parts)
+            return out["text"].strip()
+        except RuntimeError as e:          # CUDA OOM 或其他 GPU 錯誤
+            last_err = e
+            if attempt < 4:
+                print(f"  ⚠ ASR 失敗，重試 ({attempt+1}/4)… {e}")
+                time.sleep(1.0)
+    raise last_err
+
+
+def _vad_extract_speech(audio: np.ndarray) -> np.ndarray:
+    """Energy VAD:只保留能量超過 AUTO_VAD_THRESHOLD 的語音幀(前後加 padding)。
+    大幅減少送給 Whisper 的靜音,避免幻覺重複詞。
+    若語音比例低於 5% → 回傳空陣列(讓呼叫方視為靜音跳過)。"""
+    frame_n  = int(SAMPLE_RATE * 0.030)           # 30ms / 幀
+    pad_n    = max(1, round(AUTO_VAD_PAD_MS / 30)) # 要延伸幾幀
+    n_frames = len(audio) // frame_n
+    if n_frames == 0:
+        return audio
+
+    frames = audio[: n_frames * frame_n].reshape(n_frames, frame_n)
+    rms    = np.sqrt(np.mean(frames ** 2, axis=1))
+    is_sp  = rms > AUTO_VAD_THRESHOLD
+
+    # 膨脹:語音幀往兩側延伸 pad_n 幀
+    mask = np.zeros(n_frames, dtype=bool)
+    for i in np.where(is_sp)[0]:
+        mask[max(0, i - pad_n) : min(n_frames, i + pad_n + 1)] = True
+
+    ratio = float(mask.sum()) / n_frames
+    if ratio < 0.05:
+        return np.array([], dtype=np.float32)
+
+    filtered = frames[mask].flatten()
+    print(f"    [VAD] 保留 {ratio*100:.0f}% "
+          f"({filtered.shape[0]/SAMPLE_RATE:.1f}s / {audio.shape[0]/SAMPLE_RATE:.1f}s)")
+    return filtered
+
+
 
 def _dictate_worker(audio: np.ndarray, my_session: int):
     """普通聽寫模式。被打斷(session 變)就放棄,避免打字打到新一輪錄音的視窗。"""
@@ -790,9 +1320,9 @@ def _dictate_worker(audio: np.ndarray, my_session: int):
         print(f"  ✗ 轉錄失敗: {e}")
         beep_error()
 
-def _ai_worker(audio: np.ndarray, context: str, my_session: int):
+def _ai_worker(audio: np.ndarray, context: str, my_session: int, clip_image=(None, None)):
     """AI 問答模式:ASR → LLM → 打字 + 念。被打斷(session 變)就靜默放棄。"""
-    global _last_sent_clipboard
+    global _last_sent_clipboard, _last_sent_image_hash
     def cancelled():
         return _session_id != my_session
     try:
@@ -805,32 +1335,44 @@ def _ai_worker(audio: np.ndarray, context: str, my_session: int):
             beep_error()
             return
 
-        # 脈絡去重:跟上次送過的剪貼簿一樣就不重複送
+        # 脈絡去重:文字跟圖片分開判斷,相同就不重複送
         snapshot      = context
         effective_ctx = context
+        img_b64, img_mime = clip_image
+        img_hash = hashlib.md5(img_b64.encode()).hexdigest() if img_b64 else ""
+
         if context and context == _last_sent_clipboard:
             print("  ⓘ 剪貼簿同上一次,不再重複送脈絡。")
             effective_ctx = ""
+        if img_b64 and img_hash == _last_sent_image_hash:
+            print("  ⓘ 圖片同上一次,不再重複送。")
+            img_b64 = img_mime = None
 
         turns = len(_chat_history) // 2
-        print(f"  → 送 LLM … (脈絡 {len(effective_ctx)} 字 / 歷史 {turns} 輪)")
+        ctx_preview = (effective_ctx[:80] + "…") if len(effective_ctx) > 80 else effective_ctx
+        img_note = f" + 圖片" if img_b64 else ""
+        print(f"  → 送 LLM … (脈絡 {len(effective_ctx)} 字{img_note} / 歷史 {turns} 輪)"
+              + (f"\n     脈絡: {ctx_preview!r}" if effective_ctx else ""))
         t1     = time.time()
-        answer, user_msg = _ask_llm(effective_ctx, question)
+        answer, user_msg = _ask_llm(effective_ctx, question, img_b64, img_mime)
+        answer = _parse_and_save_memory(answer)   # 抽出 <save_memory> tag 並存檔
         print(f"  → LLM ({time.time()-t1:.1f}s) {answer!r}")
         if cancelled():
             print("  ⓘ 已被新一輪打斷,丟棄此次回覆。"); return
 
-        # 提交本輪到記憶(打斷前不會跑到這,所以記憶乾淨)
+        # 提交本輪到記憶
         _chat_history.append({"role": "user",      "content": user_msg})
         _chat_history.append({"role": "assistant", "content": answer})
-        _last_sent_clipboard = snapshot   # 記住這次的剪貼簿,下次比對
+        _last_sent_clipboard = snapshot
+        if img_hash:
+            _last_sent_image_hash = img_hash
+        threading.Thread(target=_save_history, daemon=True).start()
 
-        # 永遠先輸出文字(攤平成單行純文字),再念出來
-        _output_ai_text(_clean_for_typing(answer))
-        print("  ✓ 已輸出文字。")
+        # 只念出來,不貼文字
         # 任一 TTS 引擎可用就念
         _tts_available = (
-            (AI_TTS_ENGINE == "eleven" and ELEVEN_API_KEY)
+            (AI_TTS_ENGINE == "minimax" and MINIMAX_API_KEY and MINIMAX_GROUP_ID)
+            or (AI_TTS_ENGINE in ("minimax", "eleven") and ELEVEN_API_KEY)
             or AI_TTS_ENGINE == "cosy"
             or (AI_TTS_ENGINE == "gemini" and GEMINI_API_KEY)
             or _HAS_TTS
@@ -854,7 +1396,7 @@ def _ai_worker(audio: np.ndarray, context: str, my_session: int):
 
 # ─────────────────────── 熱鍵邏輯 ────────────────────────
 def _start_recording(ai: bool):
-    global _recording, _frames, _timeout_timer, _ai_mode, _ai_context, _session_id
+    global _recording, _frames, _timeout_timer, _ai_mode, _ai_context, _ai_image, _session_id
     # 打斷任何正在播放/排隊的 TTS,並讓任何進行中的 worker 失效
     _stop_speech()
     with _lock:
@@ -865,10 +1407,11 @@ def _start_recording(ai: bool):
         _recording = True
         _ai_mode   = ai
         _ai_context = ""
+        _ai_image   = (None, None)
     if ai:
-        # 先快照剪貼簿,讓後面錄音時使用者可以繼續複製新內容也沒關係
-        try:    _ai_context = pyperclip.paste()
-        except: _ai_context = ""
+        # 先快照剪貼簿(含圖片),讓後面錄音時使用者可以繼續複製新內容也沒關係
+        _ai_context, img_b64, img_mime = _snapshot_clipboard()
+        _ai_image = (img_b64, img_mime)
         beep_ai_start()
         print(f"★ AI 模式錄音中…(再按 Copilot 停止;最長 {MAX_SECONDS}s)")
     else:
@@ -905,7 +1448,7 @@ def _stop_recording():
     sid = _session_id
     print(f"■ 停止,長度 {dur:.1f}s,{'AI 問答' if ai else '轉錄'}中…")
     if ai:
-        threading.Thread(target=_ai_worker,      args=(audio, ctx, sid), daemon=True).start()
+        threading.Thread(target=_ai_worker,      args=(audio, ctx, sid, _ai_image), daemon=True).start()
     else:
         threading.Thread(target=_dictate_worker, args=(audio, sid),      daemon=True).start()
 
@@ -955,43 +1498,40 @@ def _auto_tick():
     threading.Thread(target=_auto_worker,
                      args=(audio, _auto_context), daemon=True).start()
 
-def _auto_ask_openrouter(context: str, question: str) -> str:
-    """全自動模式用 OpenRouter(便宜模型)回答,不帶完整歷史、只帶摘要。"""
+def _auto_ask_openrouter(context: str, question: str) -> tuple[str, str]:
+    """全自動模式 LLM:只帶最近 5 輪歷史 + 摘要,省 token。"""
     user_msg = ""
     if context.strip():
-        user_msg += f"【剪貼簿內容】\n{context.strip()}\n\n"
-    user_msg += f"【問題/說話內容】\n{question.strip()}"
-    # system prompt 跟主模式一樣,只是走不同 endpoint
+        user_msg += f"[Clipboard]\n{context.strip()}\n\n"
+    user_msg += f"[Question]\n{question.strip()}"
     sys = AI_SYSTEM_PROMPT
     if _chat_summary:
-        sys += f"\n\n【先前對話摘要】\n{_chat_summary}"
-    messages = [{"role": "system", "content": sys}]
-    # 只帶最近 5 輪逐字(不帶全部 15 輪,省 token)
-    messages += list(_chat_history)[-10:]
-    messages.append({"role": "user", "content": user_msg})
-    resp = requests.post(
-        AUTO_LLM_URL,
-        headers={"Authorization": f"Bearer {AUTO_LLM_KEY}",
-                 "Content-Type": "application/json"},
-        data=json.dumps({"model": AUTO_LLM_MODEL, "messages": messages}),
-        timeout=60,
-    )
-    resp.raise_for_status()
-    return resp.json()["choices"][0]["message"]["content"].strip(), user_msg
+        sys += f"\n\n[Previous conversation summary]\n{_chat_summary}"
+    messages = list(_chat_history)[-10:] + [{"role": "user", "content": user_msg}]
+    answer = _call_llm(AUTO_LLM_URL, AUTO_LLM_KEY, AUTO_LLM_MODEL,
+                       sys, messages, web_search=False)
+    return answer, user_msg
 
 def _auto_worker(audio: np.ndarray, context: str):
     """全自動模式的 ASR → OpenRouter → TTS worker。
     做完之後(不論成功失敗)自動開下一輪錄音。"""
     try:
-        question = _transcribe(audio)
+        # VAD:先濾掉靜音段,避免 Whisper 在靜音中幻覺重複詞
+        speech = _vad_extract_speech(audio)
+        if len(speech) < int(SAMPLE_RATE * MIN_SECONDS):
+            print(f"  [auto] VAD 後語音不足 {MIN_SECONDS}s,跳過。")
+            return
+        question = _transcribe(speech)
         print(f"  [auto] ASR: {question!r}")
         if not question.strip():
             return
         print(f"  [auto] 送 {AUTO_LLM_MODEL} …")
         answer, user_msg = _auto_ask_openrouter(context, question)
+        answer = _parse_and_save_memory(answer)
         print(f"  [auto] AI: {answer!r}")
         _chat_history.append({"role": "user",      "content": user_msg})
         _chat_history.append({"role": "assistant", "content": answer})
+        threading.Thread(target=_save_history, daemon=True).start()
         _output_ai_text(_clean_for_typing(answer))
         if AI_TTS:
             _speak(_clean_for_speech(answer))   # 念完才繼續
@@ -1057,11 +1597,11 @@ def _on_hotkey(event):
     if event.event_type != "down":
         return
     if _lctrl_down:
-        if not XAI_API_KEY:
+        if not AI_LLM_KEY:
             print("⚠ 未設定 XAI_API_KEY,無法使用自動模式。"); beep_error(); return
         _toggle_auto()
     elif _ralt_down:
-        if not XAI_API_KEY:
+        if not AI_LLM_KEY:
             print("⚠ 未設定 XAI_API_KEY,AI 模式無法使用。"); beep_error(); return
         _toggle(ai=True)
     else:
