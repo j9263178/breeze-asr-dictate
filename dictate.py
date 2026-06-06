@@ -24,6 +24,7 @@ import asyncio
 import tempfile
 import io
 import hashlib
+import gc
 import threading
 import winsound
 from pathlib import Path
@@ -443,6 +444,13 @@ def beep_auto_on():
 def beep_auto_off():  _play_file(_SND_AUTO_OFF)
 def beep_auto_tick(): _play_file(_SND_AUTO_TICK)
 
+# ─────────────────────── 單例鎖 ──────────────────────────
+# 避免不小心開到第二個 dictate 實例（會吃雙倍記憶體並互搶麥克風）。
+_singleton_mutex = ctypes.windll.kernel32.CreateMutexW(None, False, "Global\\dictate_py_singleton")
+if ctypes.windll.kernel32.GetLastError() == 183:   # ERROR_ALREADY_EXISTS
+    print("⚠ 偵測到已有一個 dictate 正在執行，本實例直接結束（避免重複佔用記憶體與麥克風）。")
+    raise SystemExit(0)
+
 # ─────────────────────── 載入模型 ────────────────────────
 print("載入 Breeze-ASR-25 中(約 20~30 秒)…")
 _t0 = time.time()
@@ -542,11 +550,37 @@ def _audio_callback(indata, frames, time_info, status):
     if _auto_recording:            # 只在錄音階段收音,processing/念出時暫停
         _auto_frames.append(indata.copy())
 
-_stream = sd.InputStream(
-    samplerate=SAMPLE_RATE, channels=1, dtype="float32",
-    callback=_audio_callback,
-)
-_stream.start()
+# 麥克風串流改為「按需開啟」：只有手動錄音 / 自動模式啟動時才建立並 start，
+# 結束後 close() 徹底釋放裝置，避免閒置時仍持續餵 AMD ACP 音訊協處理器驅動。
+_stream = None
+_stream_lock = threading.Lock()
+
+def _mic_on():
+    """確保麥克風串流已開啟（可重複呼叫，idempotent）。"""
+    global _stream
+    with _stream_lock:
+        if _stream is None:
+            _stream = sd.InputStream(
+                samplerate=SAMPLE_RATE, channels=1, dtype="float32",
+                callback=_audio_callback,
+            )
+            _stream.start()
+
+def _mic_off(force=False):
+    """若已無任何收音需求，關閉並釋放麥克風串流。
+    force=True 時無視旗標強制關閉（程式結束用）。"""
+    global _stream
+    with _stream_lock:
+        if _stream is None:
+            return
+        if not force and (_recording or _auto_recording or _auto_mode):
+            return
+        try:
+            _stream.stop()
+            _stream.close()
+        except Exception:
+            pass
+        _stream = None
 
 # ─────────────────────── 輸出文字 ────────────────────────
 # 用 SendInput 直接送 Unicode 字元 = 模擬鍵盤打字,完全不碰剪貼簿(支援中文)。
@@ -1271,6 +1305,14 @@ def _transcribe(audio: np.ndarray) -> str:
             if attempt < 4:
                 print(f"  ⚠ ASR 失敗，重試 ({attempt+1}/4)… {e}")
                 time.sleep(1.0)
+        finally:
+            # 每次推論後釋放 GPU 快取並回收 Python 物件，抑制長時間執行的記憶體膨脹
+            try:
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+            except Exception:
+                pass
+            gc.collect()
     raise last_err
 
 
@@ -1408,6 +1450,7 @@ def _start_recording(ai: bool):
         _ai_mode   = ai
         _ai_context = ""
         _ai_image   = (None, None)
+    _mic_on()                       # 按下才開麥克風
     if ai:
         # 先快照剪貼簿(含圖片),讓後面錄音時使用者可以繼續複製新內容也沒關係
         _ai_context, img_b64, img_mime = _snapshot_clipboard()
@@ -1438,6 +1481,7 @@ def _stop_recording():
         _timeout_timer.cancel()
         _timeout_timer = None
     beep_stop()
+    _mic_off()                      # 放開就關麥克風（自動模式中則保持開啟）
     if not frames:
         return
     audio = np.concatenate(frames, axis=0).flatten().astype(np.float32)
@@ -1549,6 +1593,7 @@ def _start_auto_mode():
     global _auto_mode, _auto_recording, _auto_context
     _auto_mode = True
     _auto_recording = False
+    _mic_on()                       # 自動模式：整段期間維持麥克風開啟
     if AUTO_CONTEXT:
         try:    _auto_context = pyperclip.paste()
         except: _auto_context = ""
@@ -1564,6 +1609,7 @@ def _stop_auto_mode():
         _auto_timer.cancel()
         _auto_timer = None
     beep_auto_off()
+    _mic_off()                      # 關閉自動模式：釋放麥克風
     print("★★ 全自動模式關閉。")
 
 def _toggle_auto():
@@ -1615,6 +1661,5 @@ try:
 except KeyboardInterrupt:
     pass
 finally:
-    _stream.stop()
-    _stream.close()
+    _mic_off(force=True)
     print("\n已結束。")
